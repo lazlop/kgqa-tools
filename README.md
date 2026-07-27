@@ -34,19 +34,49 @@ automatic suggested fix is worth the extra cost, not as the first thing to reach
 ## Setup
 
 Requires [`uv`](https://docs.astral.sh/uv/) and a Rust toolchain (to build the `sparql-relax-rs`
-extension the first time, since it's pulled in from GitHub).
+extension the first time — cached by uv/maturin afterwards).
+
+### Option A: run straight from GitHub (no clone)
+
+```sh
+uvx --from "git+https://github.com/lazlop/kgqa-tools" sparql-relax-mcp
+```
+
+This is the easiest way for collaborators to get the server without checking out the repo. `uv`
+clones it, resolves the `sparql-relax-rs` dependency, and builds the extension for you (cached
+after the first run).
+
+### Option B: from a local clone
 
 ```sh
 uv sync
 ```
 
+> We may publish `sparql-relax-mcp` to PyPI (or ship prebuilt wheels) in the future so this
+> doesn't require a local Rust toolchain. For now, installing from GitHub is the supported path.
+
 ### Register with Claude Code
+
+Pointed at a local clone:
 
 ```sh
 claude mcp add sparql-relax -- uv --directory /absolute/path/to/kgqa-tools run sparql-relax-mcp
 ```
 
-or by hand, in `.mcp.json`:
+or by hand, in `.mcp.json`, using the GitHub install directly (no local path needed):
+
+```json
+{
+  "mcpServers": {
+    "sparql-relax": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/lazlop/kgqa-tools", "sparql-relax-mcp"]
+    }
+  }
+}
+```
+
+or pointed at a local clone instead:
 
 ```json
 {
