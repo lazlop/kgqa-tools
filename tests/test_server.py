@@ -204,6 +204,44 @@ async def test_diagnose_with_connect_true_suggests_a_fix():
         assert len(fixed["rows"]) == culprit["row_count_with_fix"]
 
 
+# sensor1's value fails the FILTER, sensor2's passes it, so this query already returns
+# one row (sensor2) even though the FILTER is quietly excluding sensor1's.
+VALUE_TTL = """
+@prefix ex: <https://brickschema.org/schema/Brick#> .
+ex:zone1 ex:hasSensor ex:sensor1 .
+ex:sensor1 ex:hasValue 72 .
+ex:zone1 ex:hasSensor ex:sensor2 .
+ex:sensor2 ex:hasValue 2000 .
+"""
+NARROWED_QUERY = """
+PREFIX ex: <https://brickschema.org/schema/Brick#>
+SELECT ?sensor ?value WHERE {
+    ex:zone1 ex:hasSensor ?sensor .
+    ?sensor ex:hasValue ?value .
+    FILTER(?value > 1000)
+}
+"""
+
+
+@pytest.mark.asyncio
+async def test_expand_nonempty_results_defaults_to_skipping_the_search():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await client.call_tool("load_dataset", {"name": "vals", "data": VALUE_TTL})
+
+        skipped = _result_json(await client.call_tool("diagnose", {"dataset": "vals", "query": NARROWED_QUERY}))
+        assert skipped["row_count"] == 1
+        assert skipped["ok"] is True
+        assert skipped["filter_issues"] == []
+
+        expanded = _result_json(
+            await client.call_tool("diagnose", {"dataset": "vals", "query": NARROWED_QUERY, "expand_nonempty_results": True})
+        )
+        assert expanded["row_count"] == 1
+        assert expanded["ok"] is False
+        assert len(expanded["filter_issues"]) == 1
+        assert expanded["filter_issues"][0]["row_count_without_filter"] == 2
+
+
 @pytest.mark.asyncio
 async def test_query_row_limit_caps_solutions():
     async with create_connected_server_and_client_session(mcp) as client:

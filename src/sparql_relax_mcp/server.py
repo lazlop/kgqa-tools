@@ -107,35 +107,56 @@ def _require_dataset(name: str) -> Store:
 # `_datasets`. Losing that on every diagnose call the way run_eval.py's
 # per-row workers do would be far more disruptive than losing one row's
 # result. So diagnose/diagnose_and_connect calls are routed through one
-# persistent forked worker instead, only replaced -- killed and re-forked --
+# persistent worker process instead, only replaced -- killed and respawned --
 # when `load_dataset` changes what's loaded, or when a call times out;
 # datasets are expected to change rarely within a session (often just
 # once), so this stays cheap in the common case.
 #
-# The worker deliberately does *not* inherit the parent's already-built
-# `Store` objects via fork's copy-on-write, tempting as that is to avoid
-# re-parsing: by the time any worker is first forked, this process has
-# already run at least one query itself (load_dataset's own triple-count
-# check), which means Oxigraph/rayon's global thread pool may already be
-# initialized. Forking a process that already has native background threads
-# is exactly the hazard CPython's own multiprocessing docs warn about: a
-# lock (or thread-pool bookkeeping) held by a thread that doesn't exist in
-# the child can leave the child deadlocked the first time it's touched,
-# silently and non-deterministically -- os.fork() only duplicates the
-# calling thread, not whatever else was live at that instant. So the worker
-# instead re-parses each dataset's raw RDF text into its own, entirely
-# fresh `Store` the first time it's asked for -- the only thing crossing
-# the fork boundary is inert Python text (`_Dataset.data`/`.format`), never
-# an already-touched native object. This is the same reason
-# eval/run_eval.py's own `BuildingCache` parses fresh inside each forked
-# `RowWorker` rather than sharing a pre-built one from its parent.
+# The worker is started with multiprocessing's "spawn" method, not "fork".
+# fork was tried first and empirically deadlocks every diagnose call, not
+# just pathological ones: this server's stdio transport wraps sys.stdin via
+# anyio.wrap_file, which offloads blocking reads to a worker thread in
+# anyio's thread pool -- so by the time any tool call handler runs, a
+# background thread is essentially always alive, parked mid-syscall waiting
+# on the next line of stdin. Forking while that thread exists is exactly the
+# hazard CPython's own multiprocessing docs warn about: os.fork() only
+# duplicates the calling thread, so the child inherits a frozen copy of
+# whatever lock that reader thread happened to be holding (import lock,
+# allocator lock, rayon/Oxigraph's global thread-pool init lock, ...) with
+# no thread left alive to ever release it -- and the child deadlocks the
+# first time anything in it touches that lock. This diagnosis is backed by:
+# a bare fork()-plus-Pipe test works fine in isolation; forking after
+# building a Store and running a query (touching Oxigraph/rayon directly)
+# *also* works fine in isolation; but every diagnose call through the real,
+# deployed server -- launched as a subprocess talking real stdio, exactly
+# like a real MCP client would -- deadlocks for its full hard timeout, even
+# on the most trivial possible query, while this repo's own in-process
+# tests (mcp.shared.memory's in-memory transport, no stdio, no background
+# reader thread) all pass. The one difference between "deployed server" and
+# "in-process test" is exactly that stdio reader thread. Switching to spawn
+# makes the deadlock disappear entirely, which starts a brand-new
+# interpreter with no inherited threads or locks at all.
+#
+# The tradeoff: spawn gives the child no copy-on-write access to this
+# process's live `_datasets`, so the worker can no longer look a dataset's
+# raw text up in that global itself the way it could when forked. Instead,
+# `DiagnoseWorker.call()` -- which runs here in the parent, where
+# `_datasets` is real -- looks up the entry itself and sends its `data`/
+# `.format` explicitly alongside every request; the worker only ever
+# re-parses that into its own fresh `Store` the first time it sees a given
+# dataset name, cached locally for the rest of its life, exactly as before.
+# This also means the worker builds its `Store` from inert Python text, not
+# an already-touched native object shared from the parent -- which was the
+# original motivation for parsing fresh in the child even back when this
+# used fork, and remains true now for a different reason (spawn simply
+# can't share the object at all).
 #
 # This deliberately does *not* also wrap the plain `query` tool: `query`
 # doesn't run the automatic ablation search that's the actual mechanism
-# behind the hang -- a hand-crafted disconnected query passed to `query`
-# directly is comparatively rare, and adding fork overhead to the tool
-# that's supposed to be the cheap, ordinary path isn't worth guarding
-# against it.
+# behind a genuine Rust-side hang -- a hand-crafted disconnected query
+# passed to `query` directly is comparatively rare, and adding worker-
+# process overhead to the tool that's supposed to be the cheap, ordinary
+# path isn't worth guarding against it.
 
 DIAGNOSE_HARD_TIMEOUT_SECONDS = 30.0
 """Wall-clock cap per diagnose/diagnose_and_connect call, enforced by killing and
@@ -146,15 +167,17 @@ meant to catch the rare case where that Rust-side deadline itself isn't honored
 
 
 def _diagnose_worker_loop(conn: "mp.connection.Connection") -> None:
-    """Runs in the forked worker: services one `(dataset, method_name, args,
-    kwargs)` request at a time, blocking on `conn.recv()` between them. Reads
-    `_datasets` directly as this module's own global for each dataset's raw
-    `data`/`format` -- a real fork (not spawn) makes that exactly the
-    parent's state as of the moment this worker was forked -- but builds its
-    own fresh `Store` per dataset name, cached locally for the rest of this
-    worker's life, rather than reusing the parent's already-built one (see
-    the module docs above on why). Exits when the parent closes its end of
-    the pipe or sends the `None` shutdown sentinel."""
+    """Runs in the spawned worker: services one `(dataset_name, data, format,
+    method_name, args, kwargs)` request at a time, blocking on `conn.recv()`
+    between them. `data`/`format` are sent explicitly by `DiagnoseWorker.call()`
+    on every request rather than read from this module's `_datasets` global --
+    a spawned process starts a fresh interpreter with no copy-on-write access
+    to the parent's memory, so `_datasets` here would just be empty. `data is
+    None` signals the caller didn't find that dataset name loaded. Builds its
+    own fresh `Store` per dataset name the first time it's asked for, cached
+    locally (`local_stores`) for the rest of this worker's life. Exits when
+    the parent closes its end of the pipe or sends the `None` shutdown
+    sentinel."""
     local_stores: dict[str, Store] = {}
     while True:
         try:
@@ -163,14 +186,12 @@ def _diagnose_worker_loop(conn: "mp.connection.Connection") -> None:
             return
         if msg is None:
             return
-        dataset_name, method_name, args, kwargs = msg
+        dataset_name, data, fmt, method_name, args, kwargs = msg
         try:
+            if data is None:
+                raise ValueError(f"no dataset named {dataset_name!r} is loaded. Call load_dataset first.")
             if dataset_name not in local_stores:
-                dataset = _datasets.get(dataset_name)
-                if dataset is None:
-                    available = ", ".join(sorted(_datasets)) or "(none loaded)"
-                    raise ValueError(f"no dataset named {dataset_name!r} is loaded. Loaded datasets: {available}. Call load_dataset first.")
-                local_stores[dataset_name] = Store(dataset.data, format=dataset.format)
+                local_stores[dataset_name] = Store(data, format=fmt)
             store = local_stores[dataset_name]
             result = getattr(store, method_name)(*args, **kwargs)
             conn.send(("ok", result))
@@ -179,14 +200,18 @@ def _diagnose_worker_loop(conn: "mp.connection.Connection") -> None:
 
 
 class DiagnoseWorker:
-    """A persistent forked worker plus the hard-timeout watchdog around it, for
-    `diagnose`/`diagnose_and_connect` specifically -- see the module docs above
-    for why. `call()` looks like a plain function call from the caller's
-    side, but under the hood: send the request, wait up to `hard_timeout`
-    seconds for a reply, and if that expires -- or the worker dies outright --
-    kill whatever's left of it and start a replacement (which re-forks from
-    whatever `_datasets` looks like *now*, so nothing loaded after the dead
-    worker was spawned is lost) before reporting the call as failed.
+    """A persistent spawned worker process plus the hard-timeout watchdog
+    around it, for `diagnose`/`diagnose_and_connect` specifically -- see the
+    module docs above for why (and why spawn, not fork). `call()` looks like
+    a plain function call from the caller's side, but under the hood: look up
+    `dataset`'s raw text/format from this module's live `_datasets` (spawn
+    gives the worker no way to see that itself), send the request, wait up to
+    `hard_timeout` seconds for a reply, and if that expires -- or the worker
+    dies outright -- kill whatever's left of it and start a replacement
+    before reporting the call as failed. A replacement worker starts with an
+    empty local Store cache, so the next call for any dataset re-parses it
+    from whatever `_datasets` looks like *now* -- nothing loaded after the
+    dead worker was started is lost.
 
     `worker_loop`/`hard_timeout` are only ever overridden by tests (to inject
     a fast, deterministic stand-in for a real hang rather than waiting on
@@ -198,7 +223,7 @@ class DiagnoseWorker:
     ) -> None:
         self._worker_loop = worker_loop
         self._hard_timeout = hard_timeout
-        self._ctx = mp.get_context("fork")
+        self._ctx = mp.get_context("spawn")
         self._conn: Optional["mp.connection.Connection"] = None
         self._proc: Optional[mp.process.BaseProcess] = None
         self._spawn()
@@ -222,17 +247,20 @@ class DiagnoseWorker:
         self._spawn()
 
     def invalidate(self) -> None:
-        """Replaces the worker with a fresh fork, so it picks up whatever
-        `_datasets` looks like right now. Call this whenever `load_dataset`
-        loads or replaces a dataset -- otherwise the worker would keep
-        serving diagnose/diagnose_and_connect calls against its stale,
-        fork-time copy."""
+        """Replaces the worker with a fresh one, so its next call re-parses
+        whatever `_datasets` looks like right now. Call this whenever
+        `load_dataset` loads or replaces a dataset -- otherwise the worker's
+        local `Store` cache would keep serving diagnose/diagnose_and_connect
+        calls against stale data under that name."""
         self._kill_and_respawn()
 
     def call(self, dataset: str, method_name: str, *args: Any, **kwargs: Any) -> Any:
         assert self._conn is not None
+        entry = _datasets.get(dataset)
+        data = entry.data if entry is not None else None
+        fmt = entry.format if entry is not None else None
         try:
-            self._conn.send((dataset, method_name, args, kwargs))
+            self._conn.send((dataset, data, fmt, method_name, args, kwargs))
         except (BrokenPipeError, OSError):
             self._kill_and_respawn()
             raise RuntimeError("diagnose worker died before this call could be sent; it has been restarted")
@@ -388,7 +416,14 @@ def summarize_schema(dataset: str, iterations: int = 10, similarity_threshold: O
 
 
 @mcp.tool()
-def diagnose(dataset: str, query: str, connect: bool = False, ignore_cartesian_risk: bool = True, sample_limit: int = 3) -> dict[str, Any]:
+def diagnose(
+    dataset: str,
+    query: str,
+    connect: bool = False,
+    ignore_cartesian_risk: bool = True,
+    sample_limit: int = 3,
+    expand_nonempty_results: bool = False,
+) -> dict[str, Any]:
     """Run a SPARQL SELECT query against `dataset` and diagnose it. This is the tool to reach for
     for almost every query -- call it before trusting a query's result, even when you expect it
     to succeed.
@@ -417,6 +452,17 @@ def diagnose(dataset: str, query: str, connect: bool = False, ignore_cartesian_r
     include since the full result is already computed here to get the row count anyway. Pass `0`
     to skip it. Only honored when `connect=False`; `diagnose_and_connect` doesn't support it, so
     `sample_variables`/`sample_rows` are always empty when `connect=True`.
+
+    `expand_nonempty_results` controls whether the (combinatorial, and by far the most expensive
+    part of this call) triple/filter search runs at all once the query already returned at least
+    one row. Defaults to `False`: the common case is diagnosing a query that returned nothing, so
+    once a query is known to already return something, this skips the search entirely and comes
+    back immediately with `ok=true` and no culprits -- `row_count`/`sample_rows` are unaffected,
+    since they only ever cost the one query run this call always makes anyway. Pass `True` to also
+    search a nonempty result for triples/filters that are quietly narrowing it further -- useful
+    if you suspect a query is returning fewer rows than it should, not just checking it returned
+    anything at all. Only honored when `connect=False`; `diagnose_and_connect` always runs the full
+    search regardless, since a caller reaching for `connect` already wants a fix searched for.
 
     When `connect=True`, path search defaults to predicates in the Brick, ASHRAE 223P, RDFS,
     and QUDT namespaces (this tool's usual building-automation domain) -- a real fix outside
@@ -454,7 +500,14 @@ def diagnose(dataset: str, query: str, connect: bool = False, ignore_cartesian_r
         sample_variables: list[str] = []
         sample_rows: list[dict[str, Any]] = []
     else:
-        report = worker.call(dataset, "diagnose", query, ignore_cartesian_risk=ignore_cartesian_risk, sample_limit=sample_limit)
+        report = worker.call(
+            dataset,
+            "diagnose",
+            query,
+            ignore_cartesian_risk=ignore_cartesian_risk,
+            sample_limit=sample_limit,
+            expand_nonempty_results=expand_nonempty_results,
+        )
         culprits = [
             {
                 "depth": c.depth,
