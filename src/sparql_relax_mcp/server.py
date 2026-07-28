@@ -3,17 +3,18 @@
 
 Intended agent workflow: `load_dataset` once, then `summarize_schema` -- also just
 once, it's cached -- to see the graph's repeated structural patterns before writing
-any SPARQL against it. From there, for every query, call `diagnose` before trusting
-its result. Diagnosis is nearly free when the query already works (it just confirms
-the row count) and, when the query returns nothing or looks wrong, it explains *why*
--- which triple or FILTER is broken -- instead of leaving the agent with just an empty
-result to guess at. This is the reliable, repeatable core of the tool, and the one most
-agents should reach for. `diagnose`'s `connect=True` option additionally searches the
-graph's real edges for a corrected query, but that search is experimental (slower,
+any SPARQL against it. From there, `diagnose` is the tool for almost every query: it
+confirms the row count, explains *why* a broken query returns nothing or too few rows
+-- which triple or FILTER is at fault -- and, since it samples a few rows of the
+query's own result for free, usually removes the need to call `query` at all. Reach
+for `query` only as a fallback: when a query needs more rows than the sample, or is
+after something specific -- a particular room or VAV, say -- that isn't among the
+sampled rows and isn't easily pinned down with a FILTER/VALUES clause added to the
+query itself. `diagnose`'s `connect=True` option additionally searches the graph's
+real edges for a corrected query, but that search is experimental (slower,
 namespace-restricted, and not guaranteed to find or verify a real fix) -- most agents
 are better served by the default diagnosis and fixing the query themselves from its
-explanation. Only call `query`, which fetches actual result rows, once `diagnose` has
-confirmed the query returns rows.
+explanation.
 """
 
 from __future__ import annotations
@@ -34,14 +35,17 @@ mcp = FastMCP(
         "Tools for understanding and debugging SPARQL/RDF graphs. Load a graph with "
         "load_dataset, then call summarize_schema ONCE to see the graph's repeated structural "
         "patterns before writing any SPARQL against it -- it's cached, so calling it again is "
-        "free but adds nothing new. From there, for every query, ALWAYS call diagnose before "
-        "trusting its result -- it's cheap even when the query already works, and when it "
-        "doesn't it explains exactly which triple or FILTER is broken. This default diagnosis "
-        "is the reliable part of this tool; diagnose's connect=True option additionally tries "
-        "to search the graph for a corrected query, but that search is experimental and its "
-        "suggestions should be verified, not trusted outright -- leave connect off unless you "
-        "specifically want to try it. Only call query, which returns actual result rows, once "
-        "diagnose has confirmed rows come back."
+        "free but adds nothing new. From there, diagnose is the tool for almost every query -- "
+        "ALWAYS call it before trusting a query's result. It's cheap even when the query already "
+        "works, explains exactly which triple or FILTER is broken when it doesn't, and by "
+        "default also samples a few rows of the query's own result for free -- for most purposes "
+        "that sample is enough, and you don't need query at all. Only reach for query as a "
+        "fallback: when you need more rows than the sample, or are after something specific (a "
+        "particular room or VAV, say) that isn't in the sample and isn't easily pinned down by "
+        "adding a FILTER/VALUES clause to the query yourself. diagnose's connect=True option "
+        "additionally tries to search the graph for a corrected query, but that search is "
+        "experimental and its suggestions should be verified, not trusted outright -- leave "
+        "connect off unless you specifically want to try it."
     ),
 )
 
@@ -324,7 +328,7 @@ def list_datasets() -> list[dict[str, Any]]:
 
 
 @mcp.tool()
-def summarize_schema(dataset: str, iterations: int = 10, similarity_threshold: Optional[float] = None) -> dict[str, Any]:
+def summarize_schema(dataset: str, iterations: int = 10, similarity_threshold: Optional[float] = 0.3) -> dict[str, Any]:
     """Summarize `dataset`'s structure into a compact class graph (via bschema), so you can see
     its repeated patterns before writing SPARQL against it.
 
@@ -342,9 +346,12 @@ def summarize_schema(dataset: str, iterations: int = 10, similarity_threshold: O
     the data didn't compress much (e.g. it's already schema-like, or every entity is distinct)
     and the summary is less useful.
 
-    Pass `similarity_threshold` (0-1, e.g. 0.5) to group subjects whose patterns overlap above
-    that ratio instead of requiring an exact match -- useful if the default (exact isomorphism)
-    produces too many near-duplicate classes.
+    `similarity_threshold` (0-1, default 0.3) groups subjects whose patterns overlap above that
+    ratio rather than requiring an exact match -- real building/knowledge graphs rarely have
+    perfectly identical 1-hop patterns across instances, so a lenient default finds more of the
+    graph's repeated structure than exact isomorphism would. Pass `None` to require an exact
+    match instead (more classes, each more homogeneous), or a higher ratio for something in
+    between.
     """
     cached = _schema_summaries.get(dataset)
     if cached is not None:
@@ -381,23 +388,35 @@ def summarize_schema(dataset: str, iterations: int = 10, similarity_threshold: O
 
 
 @mcp.tool()
-def diagnose(dataset: str, query: str, connect: bool = False, ignore_cartesian_risk: bool = True) -> dict[str, Any]:
-    """Run a SPARQL SELECT query against `dataset` and diagnose it. ALWAYS call this before
-    `query` -- even when you expect the query to succeed.
+def diagnose(dataset: str, query: str, connect: bool = False, ignore_cartesian_risk: bool = True, sample_limit: int = 3) -> dict[str, Any]:
+    """Run a SPARQL SELECT query against `dataset` and diagnose it. This is the tool to reach for
+    for almost every query -- call it before trusting a query's result, even when you expect it
+    to succeed.
 
-    On a working query this is nearly free: it just confirms the row count (`ok: true`). On a
-    query that returns nothing, or fewer rows than expected, it explains *why* -- which BGP
-    triple(s) or FILTER(s) are responsible. If `connect=True`, it also searches the graph's
-    actual edges for a real connecting path, often finding a corrected query that actually
-    returns rows (see `connected_query` on each culprit).
+    On a working query this is nearly free: it just confirms the row count (`ok: true`) and, since
+    `sample_limit > 0` by default, includes a preview of the actual result rows in
+    `sample_variables`/`sample_rows` at no extra cost -- for most purposes that preview is enough
+    to confirm the query returns what you expect, and you don't need `query` at all. On a query
+    that returns nothing, or fewer rows than expected, this explains *why* instead -- which BGP
+    triple(s) or FILTER(s) are responsible. If `connect=True`, it also searches the graph's actual
+    edges for a real connecting path, often finding a corrected query that actually returns rows
+    (see `connected_query` on each culprit).
 
     Note: Connection is experimental. For AI agents, it is often more effective to use
     diagnose with `connect=False`, then allow the agent to correct the query itself based
     on the diagnosis.
 
     Only SELECT queries can be diagnosed (ASK/CONSTRUCT/DESCRIBE aren't supported here -- use
-    `query` directly for those). Once this reports `ok: true`, call `query` to fetch the full
-    result set: this tool's `row_count` fields are counts, not the actual rows.
+    `query` directly for those). Reach for `query` instead of relying on `sample_rows` only when
+    you need more rows than `sample_limit`, or you're after something specific -- a particular
+    room or VAV, say -- that isn't among the sampled rows and isn't easily pinned down by adding
+    a FILTER/VALUES clause to this query yourself.
+
+    `sample_limit` (default 3) caps how many rows of the query's own result are included in
+    `sample_variables`/`sample_rows`, shaped like `query`'s own `variables`/`rows` -- free to
+    include since the full result is already computed here to get the row count anyway. Pass `0`
+    to skip it. Only honored when `connect=False`; `diagnose_and_connect` doesn't support it, so
+    `sample_variables`/`sample_rows` are always empty when `connect=True`.
 
     When `connect=True`, path search defaults to predicates in the Brick, ASHRAE 223P, RDFS,
     and QUDT namespaces (this tool's usual building-automation domain) -- a real fix outside
@@ -432,8 +451,10 @@ def diagnose(dataset: str, query: str, connect: bool = False, ignore_cartesian_r
             {"expression": f.expression, "row_count_without_filter": f.row_count_without_filter} for f in report.filter_results
         ]
         cartesian_risks = report.cartesian_risks
+        sample_variables: list[str] = []
+        sample_rows: list[dict[str, Any]] = []
     else:
-        report = worker.call(dataset, "diagnose", query, ignore_cartesian_risk=ignore_cartesian_risk)
+        report = worker.call(dataset, "diagnose", query, ignore_cartesian_risk=ignore_cartesian_risk, sample_limit=sample_limit)
         culprits = [
             {
                 "depth": c.depth,
@@ -450,12 +471,23 @@ def diagnose(dataset: str, query: str, connect: bool = False, ignore_cartesian_r
             {"expression": f.expression, "row_count_without_filter": f.row_count_without_filter} for f in report.filter_culprits
         ]
         cartesian_risks = report.cartesian_risks
+        sample_variables = report.sample_variables
+        sample_rows = [
+            {var: _term_to_json(term) for var, term in zip(sample_variables, row)} for row in report.sample_rows
+        ]
 
     cartesian_risks_skipped = [{"triples": list(r.triples), "depth": r.depth} for r in cartesian_risks]
 
     ok = report.original_row_count > 0 and not culprits and not filter_issues
     if ok:
-        message = f"Query returned {report.original_row_count} row(s) with no issues found. Call `query` to fetch the full results."
+        if sample_rows:
+            message = (
+                f"Query returned {report.original_row_count} row(s) with no issues found. "
+                f"sample_rows has {len(sample_rows)} of them for a quick check -- call `query` only if "
+                "you need more rows, or a specific value these samples don't include."
+            )
+        else:
+            message = f"Query returned {report.original_row_count} row(s) with no issues found. Call `query` to fetch the results."
     elif culprits or filter_issues:
         if connect:
             message = (
@@ -485,6 +517,8 @@ def diagnose(dataset: str, query: str, connect: bool = False, ignore_cartesian_r
     return {
         "ok": ok,
         "row_count": report.original_row_count,
+        "sample_variables": sample_variables,
+        "sample_rows": sample_rows,
         "culprits": culprits,
         "filter_issues": filter_issues,
         "cartesian_risks_skipped": cartesian_risks_skipped,
@@ -497,10 +531,14 @@ def query(dataset: str, query: str, row_limit: Optional[int] = 3) -> dict[str, A
     """Run any SPARQL query (SELECT/ASK/CONSTRUCT/DESCRIBE) against `dataset` and return its
     actual results.
 
-    Call `diagnose` first on any new query -- it's cheap even when the query works, and it catches
-    broken queries with an actionable explanation instead of a bare empty result. Reach for this
-    tool only once `diagnose` has confirmed the query returns rows (or for ASK/CONSTRUCT/DESCRIBE
-    queries, which `diagnose` doesn't support).
+    This is a fallback, not the default next step after `diagnose` -- `diagnose`'s own
+    `sample_rows` already gives you a free peek at a working SELECT query's results, which is
+    enough for most purposes. Reach for `query` instead when you need more rows than the sample,
+    when you're after something specific (a particular room or VAV, say) that isn't in the sample
+    and isn't easily pinned down by adding a FILTER/VALUES clause to the query yourself, or for
+    ASK/CONSTRUCT/DESCRIBE queries, which `diagnose` doesn't support at all. Still call `diagnose`
+    first on any new SELECT query -- it's cheap even when the query works, and it catches broken
+    queries with an actionable explanation instead of a bare empty result.
 
     `row_limit` caps how many rows a SELECT/CONSTRUCT/DESCRIBE result may return (default 3 --
     enough to confirm the query returns what you expect without spending context on a full result

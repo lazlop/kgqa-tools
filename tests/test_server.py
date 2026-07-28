@@ -122,6 +122,12 @@ async def test_diagnose_reports_ok_on_a_working_query_then_query_fetches_full_re
         assert diagnosis["row_count"] == 2
         assert diagnosis["culprits"] == []
         assert diagnosis["filter_issues"] == []
+        # sample_limit defaults to 3, so both of this query's rows come back for free.
+        assert diagnosis["sample_variables"] == ["s"]
+        assert {row["s"]["value"] for row in diagnosis["sample_rows"]} == {
+            "https://brickschema.org/schema/Brick#sensor1",
+            "https://brickschema.org/schema/Brick#sensor2",
+        }
 
         result = _result_json(await client.call_tool("query", {"dataset": "b223", "query": WORKING_QUERY}))
         assert result["form"] == "solutions"
@@ -129,6 +135,31 @@ async def test_diagnose_reports_ok_on_a_working_query_then_query_fetches_full_re
         values = {row["s"]["value"] for row in result["rows"]}
         assert values == {"https://brickschema.org/schema/Brick#sensor1", "https://brickschema.org/schema/Brick#sensor2"}
         assert all(row["s"]["type"] == "uri" for row in result["rows"])
+
+
+@pytest.mark.asyncio
+async def test_diagnose_sample_limit_caps_and_can_be_disabled():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
+
+        capped = _result_json(await client.call_tool("diagnose", {"dataset": "b223", "query": WORKING_QUERY, "sample_limit": 1}))
+        assert len(capped["sample_rows"]) == 1
+
+        disabled = _result_json(await client.call_tool("diagnose", {"dataset": "b223", "query": WORKING_QUERY, "sample_limit": 0}))
+        assert disabled["sample_variables"] == []
+        assert disabled["sample_rows"] == []
+
+
+@pytest.mark.asyncio
+async def test_diagnose_with_connect_true_has_no_sample_rows():
+    # diagnose_and_connect doesn't support sample_limit, regardless of what's passed.
+    async with create_connected_server_and_client_session(mcp) as client:
+        await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
+        diagnosis = _result_json(
+            await client.call_tool("diagnose", {"dataset": "b223", "query": WORKING_QUERY, "connect": True, "sample_limit": 3})
+        )
+        assert diagnosis["sample_variables"] == []
+        assert diagnosis["sample_rows"] == []
 
 
 @pytest.mark.asyncio

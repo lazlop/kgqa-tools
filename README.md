@@ -11,29 +11,39 @@ that need to understand and query a knowledge graph.
 - **`load_dataset(name, data=None, path=None, format="turtle")`** — load RDF text (or a local
   file) into memory under `name`. Replaces any dataset already loaded under that name.
 - **`list_datasets()`** — list loaded datasets with their format and triple count.
-- **`summarize_schema(dataset, iterations=10, similarity_threshold=None)`** — summarize the
+- **`summarize_schema(dataset, iterations=10, similarity_threshold=0.3)`** — summarize the
   dataset's structure into a compact `bs:`-namespaced class graph (via bschema), so an agent can
   see the graph's repeated patterns before writing any SPARQL against it. Call this **once** per
   dataset, right after `load_dataset`; the result is cached, so a repeat call is free but won't
-  reflect changes until `load_dataset` reloads that name.
-- **`diagnose(dataset, query, connect=False)`** — the main query tool, and the one that does the
-  most reliable, repeatable work. Run a SPARQL `SELECT` query and diagnose it. Cheap even when the
-  query already works (`ok: true`); when it doesn't, explains which triple pattern or `FILTER`
-  is broken. Pass `connect=True` to also search the graph for a real connecting path and propose a
-  corrected query — this part is **experimental**: it's slower, only looks within a fixed set of
-  namespaces, and a suggested fix should be verified, not trusted outright. Most agents get what
-  they need from the default (`connect=False`) diagnosis and fix the query themselves from there.
+  reflect changes until `load_dataset` reloads that name. `similarity_threshold` defaults to a
+  lenient `0.3` (group subjects whose 1-hop patterns overlap by at least that much) rather than
+  requiring an exact match, since real graphs rarely have perfectly identical instance patterns.
+- **`diagnose(dataset, query, connect=False, sample_limit=3)`** — the tool for almost every
+  query. Run a SPARQL `SELECT` query and diagnose it. Cheap even when the query already works
+  (`ok: true`); when it doesn't, explains which triple pattern or `FILTER` is broken. By default
+  also returns up to `sample_limit` rows of the query's own result (`sample_variables`/
+  `sample_rows`, free since the full result is already computed to get the row count) — enough
+  for most purposes that `query` isn't needed at all. Pass `connect=True` to also search the
+  graph for a real connecting path and propose a corrected query — this part is **experimental**:
+  it's slower, only looks within a fixed set of namespaces, not guaranteed to find or verify a
+  real fix, and doesn't support `sample_limit`. Most agents get what they need from the default
+  (`connect=False`) diagnosis and fix the query themselves from there.
 - **`query(dataset, query, row_limit=3)`** — run any SPARQL query form (`SELECT`, `ASK`,
-  `CONSTRUCT`, `DESCRIBE`) and return the actual results. Defaults to just 3 rows — enough to
-  confirm the query returns what's expected without spending context on a full result set; pass a
-  higher `row_limit` (or `null`) once you actually need more.
+  `CONSTRUCT`, `DESCRIBE`) and return the actual results. A fallback, not the default next step
+  after `diagnose` — reach for it when you need more rows than `diagnose`'s sample, when you're
+  after something specific (a particular room or VAV, say) that isn't in the sample and isn't
+  easily pinned down with a FILTER/VALUES clause of your own, or for `ASK`/`CONSTRUCT`/`DESCRIBE`,
+  which `diagnose` doesn't support at all. Defaults to just 3 rows — enough to confirm the query
+  returns what's expected without spending context on a full result set; pass a higher `row_limit`
+  (or `null`) once you actually need more.
 
 **Intended workflow:** `load_dataset`, then `summarize_schema` once to understand the graph's
-shape. From there, call `diagnose` on every new query before trusting its result — it's nearly
-free when the query works and tells you exactly what's wrong when it doesn't. Only call `query`
-once `diagnose` confirms rows come back (or directly, for `ASK`/`CONSTRUCT`/`DESCRIBE`, which
-`diagnose` doesn't support). Leave `connect` off by default; it's there for cases where an
-automatic suggested fix is worth the extra cost, not as the first thing to reach for.
+shape. From there, `diagnose` is the tool for almost every query — call it before trusting a
+query's result, even when you expect it to succeed; it's nearly free when the query works, tells
+you exactly what's wrong when it doesn't, and its `sample_rows` usually make a separate `query`
+call unnecessary. Reach for `query` only as a fallback (see above). Leave `connect` off by
+default; it's there for cases where an automatic suggested fix is worth the extra cost, not as
+the first thing to reach for.
 
 ## Setup
 
