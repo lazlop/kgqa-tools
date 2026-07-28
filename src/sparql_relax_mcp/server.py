@@ -1,17 +1,19 @@
-"""MCP server exposing `sparql_relax`: SPARQL query execution and diagnosis over
-in-memory RDF graphs, for AI agents.
+"""MCP server exposing `sparql_relax`'s SPARQL query execution and diagnosis, and
+`bschema`'s structural graph summarization, over in-memory RDF graphs, for AI agents.
 
-Intended agent workflow: `load_dataset` once, then for every query, call `diagnose`
-before trusting its result. Diagnosis is nearly free when the query already works (it
-just confirms the row count) and, when the query returns nothing or looks wrong, it
-explains *why* -- which triple or FILTER is broken -- instead of leaving the agent with
-just an empty result to guess at. This is the reliable, repeatable core of the tool, and
-the one most agents should reach for. `diagnose`'s `connect=True` option additionally
-searches the graph's real edges for a corrected query, but that search is experimental
-(slower, namespace-restricted, and not guaranteed to find or verify a real fix) -- most
-agents are better served by the default diagnosis and fixing the query themselves from
-its explanation. Only call `query`, which fetches the full result set, once `diagnose`
-has confirmed the query returns rows.
+Intended agent workflow: `load_dataset` once, then `summarize_schema` -- also just
+once, it's cached -- to see the graph's repeated structural patterns before writing
+any SPARQL against it. From there, for every query, call `diagnose` before trusting
+its result. Diagnosis is nearly free when the query already works (it just confirms
+the row count) and, when the query returns nothing or looks wrong, it explains *why*
+-- which triple or FILTER is broken -- instead of leaving the agent with just an empty
+result to guess at. This is the reliable, repeatable core of the tool, and the one most
+agents should reach for. `diagnose`'s `connect=True` option additionally searches the
+graph's real edges for a corrected query, but that search is experimental (slower,
+namespace-restricted, and not guaranteed to find or verify a real fix) -- most agents
+are better served by the default diagnosis and fixing the query themselves from its
+explanation. Only call `query`, which fetches actual result rows, once `diagnose` has
+confirmed the query returns rows.
 """
 
 from __future__ import annotations
@@ -21,20 +23,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from bschema_rs import create_bschema
 from mcp.server.fastmcp import FastMCP
+from rdflib import Graph
 from sparql_relax import QueryResult, Store, Term
 
 mcp = FastMCP(
     name="sparql-relax",
     instructions=(
-        "Tools for running and debugging SPARQL queries against RDF graphs. Load a graph with "
-        "load_dataset, then ALWAYS call diagnose on a query before trusting its result -- it's "
-        "cheap even when the query already works, and when it doesn't it explains exactly which "
-        "triple or FILTER is broken. This default diagnosis is the reliable part of this tool; "
-        "diagnose's connect=True option additionally tries to search the graph for a corrected "
-        "query, but that search is experimental and its suggestions should be verified, not "
-        "trusted outright -- leave connect off unless you specifically want to try it. Only call "
-        "query, which returns the full result set, once diagnose has confirmed rows come back."
+        "Tools for understanding and debugging SPARQL/RDF graphs. Load a graph with "
+        "load_dataset, then call summarize_schema ONCE to see the graph's repeated structural "
+        "patterns before writing any SPARQL against it -- it's cached, so calling it again is "
+        "free but adds nothing new. From there, for every query, ALWAYS call diagnose before "
+        "trusting its result -- it's cheap even when the query already works, and when it "
+        "doesn't it explains exactly which triple or FILTER is broken. This default diagnosis "
+        "is the reliable part of this tool; diagnose's connect=True option additionally tries "
+        "to search the graph for a corrected query, but that search is experimental and its "
+        "suggestions should be verified, not trusted outright -- leave connect off unless you "
+        "specifically want to try it. Only call query, which returns actual result rows, once "
+        "diagnose has confirmed rows come back."
     ),
 )
 
@@ -48,6 +55,22 @@ class _Dataset:
 
 
 _datasets: dict[str, _Dataset] = {}
+
+_schema_summaries: dict[str, dict[str, Any]] = {}
+"""Cache of `summarize_schema` results, keyed by dataset name -- computing a bschema
+class graph is real work (iterative graph relabeling), and the point of the tool is
+to be called once per dataset, so a repeat call should be free rather than
+recomputing. Cleared for a name whenever `load_dataset` replaces it."""
+
+_RDFLIB_FORMATS = {
+    "turtle": "turtle",
+    "ntriples": "nt",
+    "nquads": "nquads",
+    "rdfxml": "xml",
+    "trig": "trig",
+}
+"""Maps `load_dataset`'s `format` values (sparql_relax/Oxigraph naming) to the format
+names rdflib's `Graph.parse` expects, which differ for a couple of these."""
 
 
 def _require_dataset(name: str) -> Store:
@@ -290,6 +313,7 @@ def load_dataset(name: str, data: Optional[str] = None, path: Optional[str] = No
     triple_count = int(count_result.rows[0][0].value)  # type: ignore[union-attr,index]
     _datasets[name] = _Dataset(store=store, data=data, format=format, triple_count=triple_count)
     _invalidate_diagnose_worker()
+    _schema_summaries.pop(name, None)
     return {"name": name, "format": format, "triple_count": triple_count}
 
 
@@ -297,6 +321,63 @@ def load_dataset(name: str, data: Optional[str] = None, path: Optional[str] = No
 def list_datasets() -> list[dict[str, Any]]:
     """List every dataset currently loaded via `load_dataset`, with its format and triple count."""
     return [{"name": name, "format": ds.format, "triple_count": ds.triple_count} for name, ds in sorted(_datasets.items())]
+
+
+@mcp.tool()
+def summarize_schema(dataset: str, iterations: int = 10, similarity_threshold: Optional[float] = None) -> dict[str, Any]:
+    """Summarize `dataset`'s structure into a compact class graph (via bschema), so you can see
+    its repeated patterns before writing SPARQL against it.
+
+    Call this ONCE per dataset, right after `load_dataset` and before your first `diagnose`/
+    `query` call -- knowing the graph's shape up front is what makes it possible to write a
+    plausible query on the first try instead of guessing at predicates and class names. The
+    result is cached, so calling it again for the same dataset is free but returns the same
+    summary; it won't reflect changes until `load_dataset` reloads that name.
+
+    The returned `class_graph` (Turtle) groups subjects that share the same 1-hop structural
+    pattern into a single derived `bs:`-namespaced class -- read it the way you'd read a schema,
+    not as data to query directly. `compression_pct` (class graph size / original graph size)
+    gives a rough sense of how repetitive the data is: a low percentage means most entities
+    collapsed into a few patterns and the summary is trustworthy; a percentage close to 100 means
+    the data didn't compress much (e.g. it's already schema-like, or every entity is distinct)
+    and the summary is less useful.
+
+    Pass `similarity_threshold` (0-1, e.g. 0.5) to group subjects whose patterns overlap above
+    that ratio instead of requiring an exact match -- useful if the default (exact isomorphism)
+    produces too many near-duplicate classes.
+    """
+    cached = _schema_summaries.get(dataset)
+    if cached is not None:
+        return cached
+
+    ds = _datasets.get(dataset)
+    if ds is None:
+        available = ", ".join(sorted(_datasets)) or "(none loaded)"
+        raise ValueError(f"no dataset named {dataset!r} is loaded. Loaded datasets: {available}. Call load_dataset first.")
+
+    rdflib_format = _RDFLIB_FORMATS[ds.format]
+    data_graph = Graph(store="Oxigraph")
+    data_graph.parse(data=ds.data, format=rdflib_format)
+
+    class_graph, _member_graph, iterations_run = create_bschema(
+        data_graph, iterations=iterations, similarity_threshold=similarity_threshold
+    )
+    class_graph_text = class_graph.serialize(format="turtle")
+    original_size = len(data_graph)
+    compression_pct = (len(class_graph) / original_size * 100) if original_size else 0.0
+
+    result = {
+        "class_graph": class_graph_text,
+        "compression_pct": round(compression_pct, 2),
+        "iterations_run": iterations_run,
+        "message": (
+            f"Compressed {original_size} triples to {len(class_graph)} ({compression_pct:.1f}%) in "
+            f"{iterations_run} iteration(s). Use class_graph to understand the graph's structure, "
+            "then call diagnose on your queries."
+        ),
+    }
+    _schema_summaries[dataset] = result
+    return result
 
 
 @mcp.tool()
@@ -412,7 +493,7 @@ def diagnose(dataset: str, query: str, connect: bool = False, ignore_cartesian_r
 
 
 @mcp.tool()
-def query(dataset: str, query: str, row_limit: Optional[int] = 1000) -> dict[str, Any]:
+def query(dataset: str, query: str, row_limit: Optional[int] = 3) -> dict[str, Any]:
     """Run any SPARQL query (SELECT/ASK/CONSTRUCT/DESCRIBE) against `dataset` and return its
     actual results.
 
@@ -421,9 +502,10 @@ def query(dataset: str, query: str, row_limit: Optional[int] = 1000) -> dict[str
     tool only once `diagnose` has confirmed the query returns rows (or for ASK/CONSTRUCT/DESCRIBE
     queries, which `diagnose` doesn't support).
 
-    `row_limit` caps how many rows a SELECT/CONSTRUCT/DESCRIBE result may return (default 1000,
-    to keep results a reasonable size to return to you); has no effect on ASK. Pass a higher value
-    if you know you need more rows, or `null` for no limit.
+    `row_limit` caps how many rows a SELECT/CONSTRUCT/DESCRIBE result may return (default 3 --
+    enough to confirm the query returns what you expect without spending context on a full result
+    set); has no effect on ASK. Pass a higher value, or `null` for no limit, once you actually need
+    more rows than that (e.g. to hand real results back to the user).
     """
     store = _require_dataset(dataset)
     result: QueryResult = store.query(query, row_limit=row_limit)

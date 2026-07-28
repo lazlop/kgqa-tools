@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 from mcp.shared.memory import create_connected_server_and_client_session
 
-from sparql_relax_mcp.server import _datasets, mcp
+from sparql_relax_mcp.server import _datasets, _schema_summaries, mcp
 
 # Uses the Brick namespace (rather than an arbitrary made-up one) because diagnose's
 # connection path search defaults to Brick/223P/RDFS/QUDT predicates only (see
@@ -37,8 +37,10 @@ SELECT ?sensor WHERE {
 def _clear_datasets():
     """Datasets are process-global module state; reset between tests so they don't leak."""
     _datasets.clear()
+    _schema_summaries.clear()
     yield
     _datasets.clear()
+    _schema_summaries.clear()
 
 
 def _result_json(call_tool_result) -> dict:
@@ -48,10 +50,10 @@ def _result_json(call_tool_result) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_lists_all_four_tools():
+async def test_lists_all_five_tools():
     async with create_connected_server_and_client_session(mcp) as client:
         tools = (await client.list_tools()).tools
-        assert {t.name for t in tools} == {"load_dataset", "list_datasets", "diagnose", "query"}
+        assert {t.name for t in tools} == {"load_dataset", "list_datasets", "summarize_schema", "diagnose", "query"}
 
 
 @pytest.mark.asyncio
@@ -75,6 +77,35 @@ async def test_load_dataset_rejects_both_data_and_path():
 async def test_query_without_loading_dataset_first_is_a_clear_error():
     async with create_connected_server_and_client_session(mcp) as client:
         result = await client.call_tool("query", {"dataset": "missing", "query": "SELECT * WHERE { ?s ?p ?o }"})
+        assert result.isError
+        text = "".join(block.text for block in result.content if block.type == "text")
+        assert "no dataset named 'missing'" in text
+        assert "load_dataset" in text
+
+
+@pytest.mark.asyncio
+async def test_summarize_schema_returns_class_graph_and_caches():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
+
+        summary = _result_json(await client.call_tool("summarize_schema", {"dataset": "b223"}))
+        assert "bs:" in summary["class_graph"] or "urn:bschema#" in summary["class_graph"]
+        assert isinstance(summary["compression_pct"], (int, float))
+        assert isinstance(summary["iterations_run"], int)
+
+        # Cached: a second call returns the exact same result without recomputing.
+        again = _result_json(await client.call_tool("summarize_schema", {"dataset": "b223"}))
+        assert again == summary
+
+        # Reloading the dataset invalidates the cache for that name.
+        await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
+        assert "b223" not in _schema_summaries
+
+
+@pytest.mark.asyncio
+async def test_summarize_schema_without_loading_dataset_first_is_a_clear_error():
+    async with create_connected_server_and_client_session(mcp) as client:
+        result = await client.call_tool("summarize_schema", {"dataset": "missing"})
         assert result.isError
         text = "".join(block.text for block in result.content if block.type == "text")
         assert "no dataset named 'missing'" in text
@@ -148,6 +179,16 @@ async def test_query_row_limit_caps_solutions():
         await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
         result = _result_json(await client.call_tool("query", {"dataset": "b223", "query": WORKING_QUERY, "row_limit": 1}))
         assert len(result["rows"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_query_default_row_limit_is_three():
+    ttl = TTL + "\n".join(f"ex:sensor{i} a ex:TempSensor ." for i in range(3, 8))
+    query_all_sensors = "PREFIX ex: <https://brickschema.org/schema/Brick#> SELECT ?s WHERE { ?s a ex:TempSensor }"
+    async with create_connected_server_and_client_session(mcp) as client:
+        await client.call_tool("load_dataset", {"name": "b223", "data": ttl})
+        result = _result_json(await client.call_tool("query", {"dataset": "b223", "query": query_all_sensors}))
+        assert len(result["rows"]) == 3
 
 
 @pytest.mark.asyncio

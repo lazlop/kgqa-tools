@@ -1,34 +1,38 @@
 # kgqa-tools
 
 MCP ([Model Context Protocol](https://modelcontextprotocol.io)) tooling for AI agents working
-with RDF/SPARQL knowledge graphs. Currently ships an MCP server built on
-[`sparql-relax`](https://github.com/lazlop/sparql-relax) that lets agents load RDF graphs, run
-SPARQL queries, and diagnose queries that return nothing (or less than expected).
-
-This repo is intended to grow into the combined home for [`sparql-relax`](https://github.com/lazlop/sparql-relax)
-(query diagnosis) and [`bschema`](https://github.com/lazlop/bschema) (graph structural
-summarization) as MCP tools for knowledge-graph question answering agents — bschema integration
-is not wired in yet.
+with RDF/SPARQL knowledge graphs. Ships an MCP server combining
+[`sparql-relax`](https://github.com/lazlop/sparql-relax) (SPARQL query execution and diagnosis)
+with [`bschema`](https://github.com/lazlop/bschema) (structural graph summarization), for agents
+that need to understand and query a knowledge graph.
 
 ## Tools
 
 - **`load_dataset(name, data=None, path=None, format="turtle")`** — load RDF text (or a local
   file) into memory under `name`. Replaces any dataset already loaded under that name.
 - **`list_datasets()`** — list loaded datasets with their format and triple count.
-- **`diagnose(dataset, query, connect=False)`** — the main tool, and the one that does the most
-  reliable, repeatable work. Run a SPARQL `SELECT` query and diagnose it. Cheap even when the
+- **`summarize_schema(dataset, iterations=10, similarity_threshold=None)`** — summarize the
+  dataset's structure into a compact `bs:`-namespaced class graph (via bschema), so an agent can
+  see the graph's repeated patterns before writing any SPARQL against it. Call this **once** per
+  dataset, right after `load_dataset`; the result is cached, so a repeat call is free but won't
+  reflect changes until `load_dataset` reloads that name.
+- **`diagnose(dataset, query, connect=False)`** — the main query tool, and the one that does the
+  most reliable, repeatable work. Run a SPARQL `SELECT` query and diagnose it. Cheap even when the
   query already works (`ok: true`); when it doesn't, explains which triple pattern or `FILTER`
   is broken. Pass `connect=True` to also search the graph for a real connecting path and propose a
   corrected query — this part is **experimental**: it's slower, only looks within a fixed set of
   namespaces, and a suggested fix should be verified, not trusted outright. Most agents get what
   they need from the default (`connect=False`) diagnosis and fix the query themselves from there.
-- **`query(dataset, query, row_limit=1000)`** — run any SPARQL query form (`SELECT`, `ASK`,
-  `CONSTRUCT`, `DESCRIBE`) and return the actual results.
+- **`query(dataset, query, row_limit=3)`** — run any SPARQL query form (`SELECT`, `ASK`,
+  `CONSTRUCT`, `DESCRIBE`) and return the actual results. Defaults to just 3 rows — enough to
+  confirm the query returns what's expected without spending context on a full result set; pass a
+  higher `row_limit` (or `null`) once you actually need more.
 
-**Intended workflow:** call `diagnose` on every new query before trusting its result — it's
-nearly free when the query works and tells you exactly what's wrong when it doesn't. Only call
-`query` once `diagnose` confirms rows come back (or directly, for `ASK`/`CONSTRUCT`/`DESCRIBE`,
-which `diagnose` doesn't support). Leave `connect` off by default; it's there for cases where an
+**Intended workflow:** `load_dataset`, then `summarize_schema` once to understand the graph's
+shape. From there, call `diagnose` on every new query before trusting its result — it's nearly
+free when the query works and tells you exactly what's wrong when it doesn't. Only call `query`
+once `diagnose` confirms rows come back (or directly, for `ASK`/`CONSTRUCT`/`DESCRIBE`, which
+`diagnose` doesn't support). Leave `connect` off by default; it's there for cases where an
 automatic suggested fix is worth the extra cost, not as the first thing to reach for.
 
 ## Setup
