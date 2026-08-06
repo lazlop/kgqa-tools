@@ -60,7 +60,11 @@ async def test_lists_all_five_tools():
 async def test_load_then_list_datasets():
     async with create_connected_server_and_client_session(mcp) as client:
         loaded = _result_json(await client.call_tool("load_dataset", {"name": "b223", "data": TTL}))
-        assert loaded == {"name": "b223", "format": "turtle", "triple_count": 4}
+        assert loaded["name"] == "b223"
+        assert loaded["format"] == "turtle"
+        assert loaded["triple_count"] == 4
+        # TTL declares its own `ex:` prefix.
+        assert loaded["declared_prefixes"]["ex"] == "https://brickschema.org/schema/Brick#"
 
         listed = _result_json(await client.call_tool("list_datasets", {}))
         assert listed["result"] == [{"name": "b223", "format": "turtle", "triple_count": 4}]
@@ -124,16 +128,16 @@ async def test_diagnose_reports_ok_on_a_working_query_then_query_fetches_full_re
         assert diagnosis["filter_issues"] == []
         # sample_limit defaults to 3, so both of this query's rows come back for free.
         assert diagnosis["sample_variables"] == ["s"]
-        assert {row["s"]["value"] for row in diagnosis["sample_rows"]} == {
-            "https://brickschema.org/schema/Brick#sensor1",
-            "https://brickschema.org/schema/Brick#sensor2",
-        }
+        # URIs come back as CURIEs (prefix:local), not full URIs, using the ex: prefix
+        # declared in both the dataset and the query.
+        assert {row["s"]["value"] for row in diagnosis["sample_rows"]} == {"ex:sensor1", "ex:sensor2"}
+        assert diagnosis["prefixes"]["ex"] == "https://brickschema.org/schema/Brick#"
 
         result = _result_json(await client.call_tool("query", {"dataset": "b223", "query": WORKING_QUERY}))
         assert result["form"] == "solutions"
         assert result["variables"] == ["s"]
         values = {row["s"]["value"] for row in result["rows"]}
-        assert values == {"https://brickschema.org/schema/Brick#sensor1", "https://brickschema.org/schema/Brick#sensor2"}
+        assert values == {"ex:sensor1", "ex:sensor2"}
         assert all(row["s"]["type"] == "uri" for row in result["rows"])
 
 
@@ -176,10 +180,12 @@ async def test_diagnose_reports_a_culprit_but_no_fix_by_default():
         assert len(diagnosis["culprits"]) == 1
 
         culprit = diagnosis["culprits"][0]
-        assert culprit["triples"][0]["triple"] == "<https://brickschema.org/schema/Brick#building223> <https://brickschema.org/schema/Brick#hasSensor> ?sensor"
+        assert culprit["triples"][0]["triple"] == "ex:building223 ex:hasSensor ?sensor"
         assert culprit["fixed"] is False
         assert culprit["connected_query"] is None
         assert culprit["row_count_with_fix"] is None
+        # TTL has no other namespace/casing for "hasSensor" to suggest -- nothing to find.
+        assert culprit["suggested_fixes"] == []
 
 
 @pytest.mark.asyncio
@@ -193,15 +199,89 @@ async def test_diagnose_with_connect_true_suggests_a_fix():
         assert len(diagnosis["culprits"]) == 1
 
         culprit = diagnosis["culprits"][0]
-        assert culprit["triples"][0]["triple"] == "<https://brickschema.org/schema/Brick#building223> <https://brickschema.org/schema/Brick#hasSensor> ?sensor"
+        assert culprit["triples"][0]["triple"] == "ex:building223 ex:hasSensor ?sensor"
         assert culprit["fixed"] is True
         assert culprit["connected_query"] is not None
         assert culprit["row_count_with_fix"] > 0
+
+        # connected_query is abbreviated to CURIEs but still directly runnable: it
+        # carries its own PREFIX lines rather than relying on the caller to supply them.
+        assert "PREFIX" in culprit["connected_query"]
 
         # The suggested connected_query should itself actually work via `query`.
         fixed = _result_json(await client.call_tool("query", {"dataset": "b223", "query": culprit["connected_query"]}))
         assert fixed["form"] == "solutions"
         assert len(fixed["rows"]) == culprit["row_count_with_fix"]
+
+
+# s223:Zone exists; queries below deliberately use the wrong namespace (rec:) or the
+# wrong case (s223:zone) for the same local name, to exercise diagnose's
+# suggest_fixes -- both are common real mistakes an agent unfamiliar with the
+# graph's exact schema would make.
+NAMESPACE_TTL = """
+@prefix s223: <http://data.ashrae.org/standard223#> .
+s223:zone1 a s223:Zone .
+s223:zone2 a s223:Zone .
+"""
+WRONG_NAMESPACE_QUERY = """
+PREFIX rec: <https://w3id.org/rec#>
+SELECT ?z WHERE { ?z a rec:Zone . }
+"""
+WRONG_CASE_QUERY = """
+PREFIX s223: <http://data.ashrae.org/standard223#>
+SELECT ?z WHERE { ?z a s223:zone . }
+"""
+
+
+@pytest.mark.asyncio
+async def test_diagnose_suggests_a_verified_wrong_namespace_fix():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await client.call_tool("load_dataset", {"name": "ns", "data": NAMESPACE_TTL})
+
+        diagnosis = _result_json(await client.call_tool("diagnose", {"dataset": "ns", "query": WRONG_NAMESPACE_QUERY}))
+        assert diagnosis["ok"] is False
+        culprit = diagnosis["culprits"][0]
+        assert len(culprit["suggested_fixes"]) == 1
+
+        fix = culprit["suggested_fixes"][0]
+        assert fix["kind"] == "wrong_namespace"
+        assert fix["original_term"] == "rec:Zone"
+        assert fix["replacement_term"] == "s223:Zone"
+        assert fix["row_count_with_fix"] == 2
+        assert "PREFIX s223:" in fix["fixed_query"]
+
+        # The fix is verified, not just guessed: rerunning fixed_query for real
+        # returns exactly what it claims.
+        rerun = _result_json(await client.call_tool("query", {"dataset": "ns", "query": fix["fixed_query"], "row_limit": None}))
+        assert len(rerun["rows"]) == fix["row_count_with_fix"]
+
+
+@pytest.mark.asyncio
+async def test_diagnose_falls_back_to_a_case_typo_fix_when_no_namespace_match_exists():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await client.call_tool("load_dataset", {"name": "ns", "data": NAMESPACE_TTL})
+
+        diagnosis = _result_json(await client.call_tool("diagnose", {"dataset": "ns", "query": WRONG_CASE_QUERY}))
+        assert diagnosis["ok"] is False
+        culprit = diagnosis["culprits"][0]
+        assert len(culprit["suggested_fixes"]) == 1
+
+        fix = culprit["suggested_fixes"][0]
+        assert fix["kind"] == "local_name_typo"
+        assert fix["original_term"] == "s223:zone"
+        assert fix["replacement_term"] == "s223:Zone"
+        assert fix["row_count_with_fix"] == 2
+
+
+@pytest.mark.asyncio
+async def test_diagnose_suggest_fixes_false_disables_the_search():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await client.call_tool("load_dataset", {"name": "ns", "data": NAMESPACE_TTL})
+
+        diagnosis = _result_json(
+            await client.call_tool("diagnose", {"dataset": "ns", "query": WRONG_NAMESPACE_QUERY, "suggest_fixes": False})
+        )
+        assert diagnosis["culprits"][0]["suggested_fixes"] == []
 
 
 # sensor1's value fails the FILTER, sensor2's passes it, so this query already returns
