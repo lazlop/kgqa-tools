@@ -201,6 +201,12 @@ uv sync
 
 ### Register with Claude Code
 
+Pointed at github: 
+
+```sh
+claude mcp add sparql-relax -- uvx --from git+https://github.com sparql-relax-mcp
+```
+
 Pointed at a local clone:
 
 ```sh
