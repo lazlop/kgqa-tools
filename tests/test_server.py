@@ -5,6 +5,8 @@ real MCP client would use.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from mcp.shared.memory import create_connected_server_and_client_session
 
@@ -104,6 +106,78 @@ async def test_summarize_schema_returns_class_graph_and_caches():
         # Reloading the dataset invalidates the cache for that name.
         await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
         assert "b223" not in _schema_summaries
+
+
+@pytest.mark.asyncio
+async def test_summarize_schema_member_counts_is_opt_in():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
+
+        without = _result_json(await client.call_tool("summarize_schema", {"dataset": "b223"}))
+        assert "member_counts" not in without
+
+        with_counts = _result_json(
+            await client.call_tool("summarize_schema", {"dataset": "b223", "include_member_counts": True})
+        )
+        # class_graph groups {building223, zone1} into one class and {sensor1, sensor2} into
+        # another (both 1-hop-identical pairs) -- member_counts should report 2 members each.
+        assert with_counts["member_counts"] == {c: 2 for c in with_counts["member_counts"]}
+        assert len(with_counts["member_counts"]) == 2
+        assert all(curie.startswith("bs:") for curie in with_counts["member_counts"])
+
+        # The flag only adds a field -- it doesn't change anything else about the summary.
+        assert with_counts["class_graph"] == without["class_graph"]
+        assert with_counts["compression_pct"] == without["compression_pct"]
+
+
+INSTANCE_NAME_TTL = """
+@prefix brick: <https://brickschema.org/schema/Brick#> .
+brick:RTU01 a brick:AHU .
+brick:RTU02 a brick:AHU .
+brick:RTU03 a brick:AHU .
+brick:RTU04 a brick:AHU .
+"""
+
+
+@pytest.mark.asyncio
+async def test_summarize_schema_class_names_are_synthetic_not_real_instance_names():
+    # create_bschema is called with use_original_names=False: each class is named after its
+    # members' shared rdf:type (e.g. bs:AHU_version_1), never after one arbitrary real instance's
+    # own IRI local name (e.g. bs:RTU01) -- the latter reads exactly like real data and could be
+    # mistaken for (or literally collide with) an actual entity in the graph.
+    async with create_connected_server_and_client_session(mcp) as client:
+        await client.call_tool("load_dataset", {"name": "rtus", "data": INSTANCE_NAME_TTL})
+        summary = _result_json(await client.call_tool("summarize_schema", {"dataset": "rtus"}))
+        assert "bs:RTU01" not in summary["class_graph"]
+        assert re.search(r"bs:AHU\w*\s+a\s+brick:AHU", summary["class_graph"])
+
+
+# bschema_rs binds its own default "brick" prefix to an *unversioned* Brick URI; a dataset that
+# declares a *versioned* one (as real Brick data commonly does) collides on prefix name but not
+# namespace.
+COLLIDING_BRICK_TTL = """
+@prefix brick: <https://brickschema.org/schema/1.1/Brick#> .
+brick:AHU1 a brick:AHU .
+brick:AHU1 brick:feeds brick:VAV1 .
+brick:VAV1 a brick:VAV .
+brick:VAV2 a brick:VAV .
+brick:AHU1 brick:feeds brick:VAV2 .
+"""
+
+
+@pytest.mark.asyncio
+async def test_summarize_schema_does_not_collapse_a_colliding_prefix_to_nsN():
+    # The fill-in loop must still bind the dataset's own (versioned) Brick namespace -- under a
+    # distinguishable prefix via rdflib's own collision handling -- rather than silently skip it
+    # because the *name* "brick" is already taken, letting it fall through to rdflib's opaque
+    # auto-generated ns1:/ns2: at serialize time.
+    async with create_connected_server_and_client_session(mcp) as client:
+        await client.call_tool("load_dataset", {"name": "brick_v11", "data": COLLIDING_BRICK_TTL})
+        summary = _result_json(await client.call_tool("summarize_schema", {"dataset": "brick_v11"}))
+
+        prefix_match = re.search(r"@prefix (\w+): <https://brickschema\.org/schema/1\.1/Brick#>", summary["class_graph"])
+        assert prefix_match is not None, summary["class_graph"]
+        assert not prefix_match.group(1).startswith("ns")
 
 
 @pytest.mark.asyncio
@@ -304,22 +378,28 @@ SELECT ?sensor ?value WHERE {
 
 
 @pytest.mark.asyncio
-async def test_expand_nonempty_results_defaults_to_skipping_the_search():
+async def test_diagnose_skips_the_expensive_search_once_a_query_already_returns_rows():
+    # ignore_cartesian_risk/expand_nonempty_results aren't exposed as MCP parameters (see
+    # test_diagnose_tool_schema_has_no_cartesian_or_expand_params) -- an MCP caller always gets
+    # the search skipped once the query already returns at least one row.
     async with create_connected_server_and_client_session(mcp) as client:
         await client.call_tool("load_dataset", {"name": "vals", "data": VALUE_TTL})
 
-        skipped = _result_json(await client.call_tool("diagnose", {"dataset": "vals", "query": NARROWED_QUERY}))
-        assert skipped["row_count"] == 1
-        assert skipped["ok"] is True
-        assert skipped["filter_issues"] == []
+        result = _result_json(await client.call_tool("diagnose", {"dataset": "vals", "query": NARROWED_QUERY}))
+        assert result["row_count"] == 1
+        assert result["ok"] is True
+        assert result["filter_issues"] == []
 
-        expanded = _result_json(
-            await client.call_tool("diagnose", {"dataset": "vals", "query": NARROWED_QUERY, "expand_nonempty_results": True})
-        )
-        assert expanded["row_count"] == 1
-        assert expanded["ok"] is False
-        assert len(expanded["filter_issues"]) == 1
-        assert expanded["filter_issues"][0]["row_count_without_filter"] == 2
+
+@pytest.mark.asyncio
+async def test_diagnose_tool_schema_has_no_cartesian_or_expand_params():
+    # README/docstring both say these aren't caller-settable over MCP -- the tool's advertised
+    # schema shouldn't offer them either.
+    async with create_connected_server_and_client_session(mcp) as client:
+        tools = {t.name: t for t in (await client.list_tools()).tools}
+        properties = tools["diagnose"].inputSchema["properties"]
+        assert "ignore_cartesian_risk" not in properties
+        assert "expand_nonempty_results" not in properties
 
 
 @pytest.mark.asyncio

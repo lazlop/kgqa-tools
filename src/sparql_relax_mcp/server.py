@@ -40,6 +40,7 @@ from typing import Any, Callable, Optional
 from bschema_rs import create_bschema
 from mcp.server.fastmcp import FastMCP
 from rdflib import Graph
+from rdflib.namespace import RDFS
 from sparql_relax import QueryResult, Store, Term
 
 mcp = FastMCP(
@@ -795,7 +796,12 @@ def list_datasets() -> list[dict[str, Any]]:
 
 
 @mcp.tool()
-def summarize_schema(dataset: str, iterations: int = 10, similarity_threshold: Optional[float] = 0.3) -> dict[str, Any]:
+def summarize_schema(
+    dataset: str,
+    iterations: int = 10,
+    similarity_threshold: Optional[float] = 0.3,
+    include_member_counts: bool = False,
+) -> dict[str, Any]:
     """Summarize `dataset`'s structure into a compact class graph (via bschema), so you can see
     its repeated patterns before writing SPARQL against it.
 
@@ -807,11 +813,13 @@ def summarize_schema(dataset: str, iterations: int = 10, similarity_threshold: O
 
     The returned `class_graph` (Turtle) groups subjects that share the same 1-hop structural
     pattern into a single derived `bs:`-namespaced class -- read it the way you'd read a schema,
-    not as data to query directly. `compression_pct` (class graph size / original graph size)
-    gives a rough sense of how repetitive the data is: a low percentage means most entities
-    collapsed into a few patterns and the summary is trustworthy; a percentage close to 100 means
-    the data didn't compress much (e.g. it's already schema-like, or every entity is distinct)
-    and the summary is less useful.
+    not as data to query directly. Each class is named after its members' shared `rdf:type` (e.g.
+    `bs:VAV_version_1 a brick:VAV`), or `bs:Resource_version_N` when the group has none -- never
+    after a specific real instance, so nothing here could be mistaken for an actual entity to
+    query. `compression_pct` (class graph size / original graph size) gives a rough sense of how
+    repetitive the data is: a low percentage means most entities collapsed into a few patterns
+    and the summary is trustworthy; a percentage close to 100 means the data didn't compress much
+    (e.g. it's already schema-like, or every entity is distinct) and the summary is less useful.
 
     `similarity_threshold` (0-1, default 0.3) groups subjects whose patterns overlap above that
     ratio rather than requiring an exact match -- real building/knowledge graphs rarely have
@@ -819,48 +827,86 @@ def summarize_schema(dataset: str, iterations: int = 10, similarity_threshold: O
     graph's repeated structure than exact isomorphism would. Pass `None` to require an exact
     match instead (more classes, each more homogeneous), or a higher ratio for something in
     between.
+
+    `include_member_counts` (default `False`) adds a `member_counts` field: a mapping from each
+    derived class's CURIE (as it appears in `class_graph`) to how many real instances it
+    collapsed, e.g. `{"bs:VAV_version_1": 50, "bs:AHU_version_1": 4}` -- lets you tell how many
+    of a given pattern actually exist (4 AHUs? 51 zones?) without spending a separate
+    `diagnose`/`query` round trip on a `COUNT` query just to find out. Off by default to keep the
+    common-case response small; pass `True` when that count matters for what you're about to
+    query.
     """
     cached = _schema_summaries.get(dataset)
-    if cached is not None:
-        return cached
+    if cached is None:
+        ds = _datasets.get(dataset)
+        if ds is None:
+            available = ", ".join(sorted(_datasets)) or "(none loaded)"
+            raise ValueError(f"no dataset named {dataset!r} is loaded. Loaded datasets: {available}. Call load_dataset first.")
 
-    ds = _datasets.get(dataset)
-    if ds is None:
-        available = ", ".join(sorted(_datasets)) or "(none loaded)"
-        raise ValueError(f"no dataset named {dataset!r} is loaded. Loaded datasets: {available}. Call load_dataset first.")
+        rdflib_format = _RDFLIB_FORMATS[ds.format]
+        data_graph = Graph(store="Oxigraph")
+        data_graph.parse(data=ds.data, format=rdflib_format)
 
-    rdflib_format = _RDFLIB_FORMATS[ds.format]
-    data_graph = Graph(store="Oxigraph")
-    data_graph.parse(data=ds.data, format=rdflib_format)
+        # use_original_names=False: name each derived class after its members' shared rdf:type
+        # (e.g. bs:VAV_version_1) instead of one arbitrary member's own IRI local name (e.g.
+        # bs:RTU01) -- the latter reads exactly like real instance data and could be mistaken for
+        # (or literally collide with) an actual entity in the graph.
+        class_graph, member_graph, iterations_run = create_bschema(
+            data_graph, iterations=iterations, similarity_threshold=similarity_threshold, use_original_names=False
+        )
+        # bschema_rs already binds its own broad default prefix list (rdf, s223, sh, ...) on
+        # class_graph -- fill in whatever's left (dataset-specific namespaces like a data file's
+        # own `ex1:`) from this dataset's own declared prefixes, without clobbering bschema_rs's
+        # picks for namespaces it already recognized. Only skip a prefix whose *namespace* is
+        # already bound -- if the *name* merely collides with a different namespace (e.g.
+        # bschema_rs's default `brick:` is an unversioned URI, but the dataset declares a
+        # versioned one), still bind it: rdflib's own `bind()` auto-suffixes the new prefix
+        # (`brick1:`) in that case rather than silently dropping it, so the dataset's real
+        # vocabulary never falls through to a serialize-time `nsN:`.
+        existing_namespaces = {str(ns) for _, ns in class_graph.namespaces()}
+        for prefix, ns in _extract_declared_prefixes(ds.data).items():
+            if ns in existing_namespaces:
+                continue
+            class_graph.bind(prefix, ns)
+        class_graph_text = class_graph.serialize(format="turtle")
+        original_size = len(data_graph)
+        compression_pct = (len(class_graph) / original_size * 100) if original_size else 0.0
 
-    class_graph, _member_graph, iterations_run = create_bschema(
-        data_graph, iterations=iterations, similarity_threshold=similarity_threshold
+        # member_graph maps each derived class to every real instance it collapsed via
+        # rdfs:member triples -- create_bschema computes it regardless of include_member_counts,
+        # so counting it here costs a groupby, not a new graph traversal. Always compute and
+        # cache it (keyed by prefixes matching class_graph's own, post-fill) so a later call with
+        # include_member_counts=True doesn't need a second bschema run.
+        prefixes = {**DEFAULT_PREFIXES, **_extract_declared_prefixes(ds.data)}
+        member_counts = {
+            _uri_to_curie(str(cls), prefixes)[0]: sum(1 for _ in member_graph.objects(cls, RDFS.member))
+            for cls in sorted(member_graph.subjects(RDFS.member, None, unique=True))
+        }
+
+        cached = {
+            "class_graph": class_graph_text,
+            "compression_pct": round(compression_pct, 2),
+            "iterations_run": iterations_run,
+            "member_counts": member_counts,
+            "original_size": original_size,
+            "class_graph_size": len(class_graph),
+        }
+        _schema_summaries[dataset] = cached
+
+    message = (
+        f"Compressed {cached['original_size']} triples to {cached['class_graph_size']} "
+        f"({cached['compression_pct']:.1f}%) in {cached['iterations_run']} iteration(s). Use "
+        "class_graph to understand the graph's structure, then call diagnose on your queries."
     )
-    # bschema_rs already binds its own broad default prefix list (rdf, s223, sh, ...) on
-    # class_graph -- fill in whatever's left (dataset-specific namespaces like a data file's own
-    # `ex1:`) from this dataset's own declared prefixes, without clobbering bschema_rs's picks for
-    # namespaces it already recognized.
-    existing_namespaces = {str(ns) for _, ns in class_graph.namespaces()}
-    existing_prefixes = {str(p) for p, _ in class_graph.namespaces()}
-    for prefix, ns in _extract_declared_prefixes(ds.data).items():
-        if ns in existing_namespaces or prefix in existing_prefixes:
-            continue
-        class_graph.bind(prefix, ns)
-    class_graph_text = class_graph.serialize(format="turtle")
-    original_size = len(data_graph)
-    compression_pct = (len(class_graph) / original_size * 100) if original_size else 0.0
-
     result = {
-        "class_graph": class_graph_text,
-        "compression_pct": round(compression_pct, 2),
-        "iterations_run": iterations_run,
-        "message": (
-            f"Compressed {original_size} triples to {len(class_graph)} ({compression_pct:.1f}%) in "
-            f"{iterations_run} iteration(s). Use class_graph to understand the graph's structure, "
-            "then call diagnose on your queries."
-        ),
+        "class_graph": cached["class_graph"],
+        "compression_pct": cached["compression_pct"],
+        "iterations_run": cached["iterations_run"],
     }
-    _schema_summaries[dataset] = result
+    if include_member_counts:
+        result["member_counts"] = cached["member_counts"]
+        message += " member_counts has each class's real instance count."
+    result["message"] = message
     return result
 
 
@@ -869,9 +915,7 @@ def diagnose(
     dataset: str,
     query: str,
     connect: bool = False,
-    ignore_cartesian_risk: bool = True,
     sample_limit: int = 3,
-    expand_nonempty_results: bool = False,
     suggest_fixes: bool = True,
 ) -> dict[str, Any]:
     """Run a SPARQL SELECT query against `dataset` and diagnose it. This is the tool to reach for
@@ -903,16 +947,11 @@ def diagnose(
     to skip it. Only honored when `connect=False`; `diagnose_and_connect` doesn't support it, so
     `sample_variables`/`sample_rows` are always empty when `connect=True`.
 
-    `expand_nonempty_results` controls whether the (combinatorial, and by far the most expensive
-    part of this call) triple/filter search runs at all once the query already returned at least
-    one row. Defaults to `False`: the common case is diagnosing a query that returned nothing, so
-    once a query is known to already return something, this skips the search entirely and comes
-    back immediately with `ok=true` and no culprits -- `row_count`/`sample_rows` are unaffected,
-    since they only ever cost the one query run this call always makes anyway. Pass `True` to also
-    search a nonempty result for triples/filters that are quietly narrowing it further -- useful
-    if you suspect a query is returning fewer rows than it should, not just checking it returned
-    anything at all. Only honored when `connect=False`; `diagnose_and_connect` always runs the full
-    search regardless, since a caller reaching for `connect` already wants a fix searched for.
+    Once the query already returns at least one row, the (combinatorial, and by far the most
+    expensive part of this call) triple/filter search is skipped entirely -- diagnosis comes back
+    immediately with `ok=true` and no culprits, since `row_count`/`sample_rows` already cost the
+    one query run this call always makes anyway. Only a query that returns nothing (or the
+    `connect=True` path, which always runs the full search regardless) triggers that search.
 
     When `connect=True`, path search defaults to predicates in the Brick, ASHRAE 223P, RDFS,
     and QUDT namespaces (this tool's usual building-automation domain) -- a real fix outside
@@ -920,12 +959,10 @@ def diagnose(
     is unaffected.
 
     Some triple combinations would force the query engine to materialize a full N x M cross
-    product before yielding a single row if checked -- by default (`ignore_cartesian_risk=True`)
-    they're checked anyway, since nothing can force a stuck check to give up early and this is
-    usually worth the (small, measured) risk to actually isolate the culprit rather than miss it.
-    Pass `ignore_cartesian_risk=False` to skip those combinations instead (reported separately in
-    `cartesian_risks_skipped`, not proof either way) if the query is large/untrusted enough that a
-    stuck evaluation isn't an acceptable risk here.
+    product before yielding a single row -- this call always skips those instead of checking them
+    (reported separately in `cartesian_risks_skipped`, not proof either way), since nothing can
+    force a stuck check to give up early and an MCP caller shouldn't risk a hung evaluation just
+    to isolate one more culprit.
 
     Every URI in the result -- in `sample_rows`, `culprits`, `connected_query`,
     `fallback_query_with_broken_triples_removed`, everywhere -- is abbreviated to `prefix:local`
@@ -983,8 +1020,10 @@ def diagnose(
         ]
 
     worker = _get_diagnose_worker()
+    # MCP callers never opt into ignoring cartesian risk or expanding a nonempty result's search
+    # -- both are hardcoded here rather than exposed as parameters (see the docstring).
     if connect:
-        report = worker.call(dataset, "diagnose_and_connect", query, ignore_cartesian_risk=ignore_cartesian_risk)
+        report = worker.call(dataset, "diagnose_and_connect", query, ignore_cartesian_risk=False)
         culprits = [
             {
                 "depth": result.found_at_depth,
@@ -1010,9 +1049,9 @@ def diagnose(
             dataset,
             "diagnose",
             query,
-            ignore_cartesian_risk=ignore_cartesian_risk,
+            ignore_cartesian_risk=False,
             sample_limit=sample_limit,
-            expand_nonempty_results=expand_nonempty_results,
+            expand_nonempty_results=False,
         )
         culprits = [
             {
@@ -1074,9 +1113,8 @@ def diagnose(
         message = (
             "Query returned 0 rows and no broken triple/filter could be isolated, but "
             f"{len(cartesian_risks_skipped)} combination(s) were skipped rather than checked (see "
-            "`cartesian_risks_skipped`) because `ignore_cartesian_risk=false` was passed -- the real "
-            "culprit may be among them. Call again without `ignore_cartesian_risk=false` (it defaults "
-            "to `true`) to force those combinations to actually be checked."
+            "`cartesian_risks_skipped`) to avoid materializing a full cross product -- the real "
+            "culprit may be among them."
         )
     else:
         message = (

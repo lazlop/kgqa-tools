@@ -11,13 +11,17 @@ that need to understand and query a knowledge graph.
 - **`load_dataset(name, data=None, path=None, format="turtle")`** — load RDF text (or a local
   file) into memory under `name`. Replaces any dataset already loaded under that name.
 - **`list_datasets()`** — list loaded datasets with their format and triple count.
-- **`summarize_schema(dataset, iterations=10, similarity_threshold=0.3)`** — summarize the
-  dataset's structure into a compact `bs:`-namespaced class graph (via bschema), so an agent can
-  see the graph's repeated patterns before writing any SPARQL against it. Call this **once** per
-  dataset, right after `load_dataset`; the result is cached, so a repeat call is free but won't
-  reflect changes until `load_dataset` reloads that name. `similarity_threshold` defaults to a
-  lenient `0.3` (group subjects whose 1-hop patterns overlap by at least that much) rather than
-  requiring an exact match, since real graphs rarely have perfectly identical instance patterns.
+- **`summarize_schema(dataset, iterations=10, similarity_threshold=0.3,
+  include_member_counts=False)`** — summarize the dataset's structure into a compact
+  `bs:`-namespaced class graph (via bschema), so an agent can see the graph's repeated patterns
+  before writing any SPARQL against it. Call this **once** per dataset, right after
+  `load_dataset`; the result is cached, so a repeat call is free but won't reflect changes until
+  `load_dataset` reloads that name. `similarity_threshold` defaults to a lenient `0.3` (group
+  subjects whose 1-hop patterns overlap by at least that much) rather than requiring an exact
+  match, since real graphs rarely have perfectly identical instance patterns. Pass
+  `include_member_counts=True` to also get `member_counts`, a mapping from each derived class's
+  CURIE to how many real instances it collapsed (e.g. `{"bs:VAV_version_1": 50}`) — off by default to keep
+  the common-case response small.
 - **`diagnose(dataset, query, connect=False, sample_limit=3, suggest_fixes=True)`** — the tool
   for almost every query. Run a SPARQL `SELECT` query and diagnose it. Cheap even when the query
   already works (`ok: true`); when it doesn't, explains which triple pattern or `FILTER` is
@@ -33,7 +37,9 @@ that need to understand and query a knowledge graph.
   edge, not a namespace mismatch) — this part is **experimental**: it's slower, only looks within
   a fixed set of namespaces, not guaranteed to find or verify a real fix, and doesn't support
   `sample_limit`. Most agents get what they need from the default (`connect=False`) diagnosis —
-  `suggest_fixes` runs either way — and fix anything else themselves from there.
+  `suggest_fixes` runs either way — and fix anything else themselves from there. A pathologically
+  stuck query is hard-killed after 30s and the internal worker is automatically restarted — you'll
+  see this as a `RuntimeError` naming the timeout, not a silent hang.
 - **`query(dataset, query, row_limit=3)`** — run any SPARQL query form (`SELECT`, `ASK`,
   `CONSTRUCT`, `DESCRIBE`) and return the actual results. A fallback, not the default next step
   after `diagnose` — reach for it when you need more rows than `diagnose`'s sample, when you're
