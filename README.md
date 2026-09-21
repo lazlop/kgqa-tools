@@ -204,7 +204,7 @@ uv sync
 Pointed at github: 
 
 ```sh
-claude mcp add sparql-relax -- uvx --from git+https://github.com sparql-relax-mcp
+claude mcp add sparql-relax -- uvx --from git+https://github.com/lazlop/kgqa-tools sparql-relax-mcp
 ```
 
 Pointed at a local clone:

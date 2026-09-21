@@ -827,7 +827,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "bschema-rs", extras = ["rdflib"], git = "https://github.com/lazlop/bschema?subdirectory=bschema-py" },
-    { name = "mcp", specifier = ">=1.6.0" },
+    { name = "mcp", specifier = ">=1.6.0,<2" },
     { name = "oxrdflib", specifier = ">=0.4.0" },
     { name = "sparql-relax-rs", git = "https://github.com/lazlop/sparql-relax?subdirectory=sparql-relax-py" },
 ]

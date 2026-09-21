@@ -5,7 +5,7 @@ description = "MCP server exposing sparql_relax's SPARQL query execution/diagnos
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "mcp>=1.6.0",
+    "mcp>=1.6.0,<2",
     "sparql-relax-rs",
     "bschema-rs[rdflib]",
     "oxrdflib>=0.4.0",
