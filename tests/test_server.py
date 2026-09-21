@@ -130,6 +130,28 @@ async def test_summarize_schema_member_counts_is_opt_in():
         assert with_counts["compression_pct"] == without["compression_pct"]
 
 
+INSTANCE_NAME_TTL = """
+@prefix brick: <https://brickschema.org/schema/Brick#> .
+brick:RTU01 a brick:AHU .
+brick:RTU02 a brick:AHU .
+brick:RTU03 a brick:AHU .
+brick:RTU04 a brick:AHU .
+"""
+
+
+@pytest.mark.asyncio
+async def test_summarize_schema_class_names_are_synthetic_not_real_instance_names():
+    # create_bschema is called with use_original_names=False: each class is named after its
+    # members' shared rdf:type (e.g. bs:AHU_version_1), never after one arbitrary real instance's
+    # own IRI local name (e.g. bs:RTU01) -- the latter reads exactly like real data and could be
+    # mistaken for (or literally collide with) an actual entity in the graph.
+    async with create_connected_server_and_client_session(mcp) as client:
+        await client.call_tool("load_dataset", {"name": "rtus", "data": INSTANCE_NAME_TTL})
+        summary = _result_json(await client.call_tool("summarize_schema", {"dataset": "rtus"}))
+        assert "bs:RTU01" not in summary["class_graph"]
+        assert re.search(r"bs:AHU\w*\s+a\s+brick:AHU", summary["class_graph"])
+
+
 # bschema_rs binds its own default "brick" prefix to an *unversioned* Brick URI; a dataset that
 # declares a *versioned* one (as real Brick data commonly does) collides on prefix name but not
 # namespace.

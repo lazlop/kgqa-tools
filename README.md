@@ -20,7 +20,7 @@ that need to understand and query a knowledge graph.
   subjects whose 1-hop patterns overlap by at least that much) rather than requiring an exact
   match, since real graphs rarely have perfectly identical instance patterns. Pass
   `include_member_counts=True` to also get `member_counts`, a mapping from each derived class's
-  CURIE to how many real instances it collapsed (e.g. `{"bs:RTU01": 4}`) — off by default to keep
+  CURIE to how many real instances it collapsed (e.g. `{"bs:VAV_version_1": 50}`) — off by default to keep
   the common-case response small.
 - **`diagnose(dataset, query, connect=False, sample_limit=3, suggest_fixes=True)`** — the tool
   for almost every query. Run a SPARQL `SELECT` query and diagnose it. Cheap even when the query

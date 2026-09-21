@@ -813,13 +813,13 @@ def summarize_schema(
 
     The returned `class_graph` (Turtle) groups subjects that share the same 1-hop structural
     pattern into a single derived `bs:`-namespaced class -- read it the way you'd read a schema,
-    not as data to query directly (each class is named after one arbitrary real instance it
-    collapsed, e.g. `bs:RTU01`, so it stands for every structurally-identical instance, not just
-    that one). `compression_pct` (class graph size / original graph size) gives a rough sense of
-    how repetitive the data is: a low percentage means most entities collapsed into a few
-    patterns and the summary is trustworthy; a percentage close to 100 means the data didn't
-    compress much (e.g. it's already schema-like, or every entity is distinct) and the summary is
-    less useful.
+    not as data to query directly. Each class is named after its members' shared `rdf:type` (e.g.
+    `bs:VAV_version_1 a brick:VAV`), or `bs:Resource_version_N` when the group has none -- never
+    after a specific real instance, so nothing here could be mistaken for an actual entity to
+    query. `compression_pct` (class graph size / original graph size) gives a rough sense of how
+    repetitive the data is: a low percentage means most entities collapsed into a few patterns
+    and the summary is trustworthy; a percentage close to 100 means the data didn't compress much
+    (e.g. it's already schema-like, or every entity is distinct) and the summary is less useful.
 
     `similarity_threshold` (0-1, default 0.3) groups subjects whose patterns overlap above that
     ratio rather than requiring an exact match -- real building/knowledge graphs rarely have
@@ -830,10 +830,11 @@ def summarize_schema(
 
     `include_member_counts` (default `False`) adds a `member_counts` field: a mapping from each
     derived class's CURIE (as it appears in `class_graph`) to how many real instances it
-    collapsed, e.g. `{"bs:RTU01": 4, "bs:UTF_1": 50}` -- lets you tell how many of a given
-    pattern actually exist (4 AHUs? 51 zones?) without spending a separate `diagnose`/`query`
-    round trip on a `COUNT` query just to find out. Off by default to keep the common-case
-    response small; pass `True` when that count matters for what you're about to query.
+    collapsed, e.g. `{"bs:VAV_version_1": 50, "bs:AHU_version_1": 4}` -- lets you tell how many
+    of a given pattern actually exist (4 AHUs? 51 zones?) without spending a separate
+    `diagnose`/`query` round trip on a `COUNT` query just to find out. Off by default to keep the
+    common-case response small; pass `True` when that count matters for what you're about to
+    query.
     """
     cached = _schema_summaries.get(dataset)
     if cached is None:
@@ -846,8 +847,12 @@ def summarize_schema(
         data_graph = Graph(store="Oxigraph")
         data_graph.parse(data=ds.data, format=rdflib_format)
 
+        # use_original_names=False: name each derived class after its members' shared rdf:type
+        # (e.g. bs:VAV_version_1) instead of one arbitrary member's own IRI local name (e.g.
+        # bs:RTU01) -- the latter reads exactly like real instance data and could be mistaken for
+        # (or literally collide with) an actual entity in the graph.
         class_graph, member_graph, iterations_run = create_bschema(
-            data_graph, iterations=iterations, similarity_threshold=similarity_threshold
+            data_graph, iterations=iterations, similarity_threshold=similarity_threshold, use_original_names=False
         )
         # bschema_rs already binds its own broad default prefix list (rdf, s223, sh, ...) on
         # class_graph -- fill in whatever's left (dataset-specific namespaces like a data file's
