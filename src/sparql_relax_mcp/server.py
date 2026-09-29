@@ -831,46 +831,99 @@ it's missing an `rdf:type` from `_ONTOLOGY_TYPES` -- e.g. Brick's deprecated ter
 `sh:` namespace counts too (a shape declared only by its `sh:or`, say); see `_strip_ontology`."""
 
 
+def _namespace(uri: str) -> str:
+    """`uri` up to and including its last `#` or `/` -- `ex:` for `ex:vav1`."""
+    return uri[: max(uri.rfind("#"), uri.rfind("/")) + 1]
+
+
 def _strip_ontology(graph: Graph) -> int:
     """Remove ontology definitions from `graph` in place, returning how many triples were removed.
 
     A subject counts as ontology if it's typed with one of `_ONTOLOGY_TYPES` (or with a metaclass
     the graph itself declares as a subclass of one, like 223P's `s223:Class rdfs:subClassOf
     rdfs:Class`), or is the subject of one of `_ONTOLOGY_PREDICATES` or of any `sh:` predicate.
-    Every triple *about* such a subject is removed, plus the blank nodes reachable from it --
+
+    Ontologies also define individuals that aren't classes, properties or shapes -- Brick's
+    `brick:Quantity`s and `brick:Substance`s, or its `tag:` namespace of `brick:Tag`s, which only
+    the removed classes point to. So the ontology's *namespaces* go too: a namespace whose
+    subjects are mostly ontology -- the terms above, plus URIs referenced only by them -- is
+    removed wholesale. "Mostly" is what keeps instance data safe: the data's own namespace can
+    hold its `owl:Ontology` header or a node some shape names in `sh:targetNode`, but those are
+    outnumbered by the actual data, so that namespace stays.
+
+    Every triple *about* a removed subject goes, plus the blank nodes reachable from it --
     `owl:Restriction`s, `sh:property` shapes, `sh:rule`s, RDF lists -- since those only exist to
     describe it. A blank node reached that way but still referenced by some kept subject is kept
     (along with everything under it), so shared structure never leaves instance data dangling.
     Triples that merely *use* an ontology term (`ex:vav1 a brick:VAV`) are untouched.
     """
+
+    # One pass over the graph into plain dicts: per-node lookups against the store (Oxigraph's
+    # especially) cost far more than the dict lookups below, and a Brick-sized graph needs
+    # hundreds of thousands of them.
+    objects_of: dict[Any, list[Any]] = {}
+    referrers_of: dict[Any, set[Any]] = {}
+    typed: dict[Any, list[Any]] = {}
+    subclasses_of: dict[Any, list[Any]] = {}
+    shacl_ns = str(SH)
+    seeds: set[Any] = set()
+    for s, p, o in graph:
+        objects_of.setdefault(s, []).append(o)
+        referrers_of.setdefault(o, set()).add(s)
+        if p == RDF.type:
+            typed.setdefault(o, []).append(s)
+        elif p == RDFS.subClassOf:
+            subclasses_of.setdefault(o, []).append(s)
+        if p in _ONTOLOGY_PREDICATES or p.startswith(shacl_ns):
+            seeds.add(s)
+
+    def with_blank_nodes(seeds: set[Any]) -> set[Any]:
+        reached: set[Any] = set()
+        frontier = list(seeds)
+        while frontier:
+            for obj in objects_of.get(frontier.pop(), ()):
+                if isinstance(obj, BNode) and obj not in seeds and obj not in reached:
+                    reached.add(obj)
+                    frontier.append(obj)
+        removed = seeds | reached
+        changed = True
+        while changed:
+            changed = False
+            for node in [n for n in reached if n in removed]:
+                if not referrers_of[node] <= removed:
+                    removed.discard(node)
+                    changed = True
+        return removed
+
     ontology_types = set(_ONTOLOGY_TYPES)
     frontier = list(ontology_types)
     while frontier:
-        for subclass in graph.subjects(RDFS.subClassOf, frontier.pop()):
+        for subclass in subclasses_of.get(frontier.pop(), ()):
             if isinstance(subclass, URIRef) and subclass not in ontology_types:
                 ontology_types.add(subclass)
                 frontier.append(subclass)
+    for t in ontology_types:
+        seeds.update(typed.get(t, ()))
+    removed = with_blank_nodes(seeds)
 
-    shacl_ns = str(SH)
-    seeds = {s for t in ontology_types for s in graph.subjects(RDF.type, t)}
-    seeds.update(s for s, p, _ in graph if p in _ONTOLOGY_PREDICATES or p.startswith(shacl_ns))
-
-    reached: set[BNode] = set()
-    frontier = list(seeds)
-    while frontier:
-        for obj in graph.objects(frontier.pop(), None):
-            if isinstance(obj, BNode) and obj not in seeds and obj not in reached:
-                reached.add(obj)
-                frontier.append(obj)
-
-    removed = seeds | reached
-    changed = True
-    while changed:
-        changed = False
-        for node in [n for n in reached if n in removed]:
-            if any(referrer not in removed for referrer in graph.subjects(None, node)):
-                removed.discard(node)
-                changed = True
+    referenced_only_by_ontology = {
+        obj
+        for node in removed
+        for obj in objects_of.get(node, ())
+        if isinstance(obj, URIRef)
+        and obj not in removed
+        and obj in objects_of
+        and referrers_of[obj] - {obj} <= removed
+    }
+    ontology_count: Counter[str] = Counter()
+    other_count: Counter[str] = Counter()
+    uri_subjects = [s for s in objects_of if isinstance(s, URIRef)]
+    for subject in uri_subjects:
+        counter = ontology_count if subject in removed or subject in referenced_only_by_ontology else other_count
+        counter[_namespace(subject)] += 1
+    ontology_namespaces = {ns for ns, n in ontology_count.items() if n > other_count[ns]}
+    seeds.update(s for s in uri_subjects if _namespace(s) in ontology_namespaces)
+    removed = with_blank_nodes(seeds)
 
     before = len(graph)
     for node in removed:
@@ -923,11 +976,13 @@ def summarize_schema(
     (`owl:Class`/`rdfs:Class`, or a metaclass declared as a subclass of one, like `s223:Class`),
     property (`rdf:Property` and the OWL property kinds), SHACL shape, and ontology header, along
     with the blank-node structure hanging off them (restrictions, property shapes, rules, lists)
-    -- before summarizing. Pass `True` when the dataset bundles its ontology (e.g. Brick or
-    223P loaded alongside the instance data), so the summary shows the instance data's patterns
-    instead of the ontology's. Only the summary is affected: the loaded dataset itself, and so
-    `run_query`, still sees every triple. Instance data typed with those classes (`ex:vav1 a
-    brick:VAV`) is kept.
+    -- before summarizing, and then every other subject in the ontology's namespaces (Brick's
+    tags, quantities and substances, say). Pass `True` when the dataset bundles its ontology
+    (e.g. Brick or 223P loaded alongside the instance data), so the summary shows the instance
+    data's patterns instead of the ontology's. Only the summary is affected: the loaded dataset
+    itself, and so `run_query`, still sees every triple. Instance data typed with those classes
+    (`ex:vav1 a brick:VAV`) is kept, and so is the data's own namespace, as long as the data
+    isn't in the same namespace as the ontology it's bundled with.
     """
     cached = _schema_summaries.get(dataset, {}).get(exclude_ontology)
     if cached is None:

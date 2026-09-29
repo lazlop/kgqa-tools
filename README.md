@@ -25,9 +25,13 @@ that need to understand and query a knowledge graph.
   ontology (Brick, 223P, ...) alongside the instance data: classes (`owl:Class`/`rdfs:Class`, or
   a metaclass subclassing one, like `s223:Class`), properties, SHACL shapes and ontology headers
   are dropped before summarizing, along with the blank nodes hanging off them (restrictions,
-  property shapes, rules, lists), so the summary shows the data's patterns rather than the
-  ontology's. Instance data typed with those classes is kept, only the summary is affected
-  (`run_query` still sees everything), and the response adds `ontology_triples_removed`.
+  property shapes, rules, lists), and then every other subject in the ontology's namespaces
+  (e.g. Brick's tags, quantities and substances), so the summary shows the data's patterns rather
+  than the ontology's. A namespace counts as the ontology's when most of its subjects are
+  ontology terms (or referenced only by them), so the data's own namespace stays even if it holds
+  an `owl:Ontology` header, as long as the data doesn't share a namespace with the ontology. Instance data typed with
+  those classes is kept, only the summary is affected (`run_query` still sees everything), and the
+  response adds `ontology_triples_removed`.
 - **`run_query(dataset, query, row_limit=3, connect=False, suggest_fixes=True)`** — the one tool
   for running queries, of any form (`SELECT`, `ASK`, `CONSTRUCT`, `DESCRIBE`). Returns the
   query's results (`variables`/`rows`, `result`, or `triples`, by `form`) *and* diagnoses it in

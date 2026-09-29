@@ -171,28 +171,42 @@ async def test_summarize_schema_member_counts_is_opt_in():
 
 
 ONTOLOGY_DATA_TTL = """
-@prefix ex: <https://brickschema.org/schema/Brick#> .
-ex:vav1 a ex:VAV ; ex:feeds ex:zone1 ; ex:hasExternalReference [ ex:id "vav-1" ] .
-ex:vav2 a ex:VAV ; ex:feeds ex:zone2 ; ex:hasExternalReference [ ex:id "vav-2" ] .
-ex:zone1 a ex:Zone .
-ex:zone2 a ex:Zone .
-ex:pump1 a ex:Pump .
+@prefix brick: <https://brickschema.org/schema/Brick#> .
+@prefix ex: <http://example.org/bldg#> .
+ex:vav1 a brick:VAV ; brick:feeds ex:zone1 ; brick:hasExternalReference [ brick:id "vav-1" ] .
+ex:vav2 a brick:VAV ; brick:feeds ex:zone2 ; brick:hasExternalReference [ brick:id "vav-2" ] .
+ex:zone1 a brick:Zone .
+ex:zone2 a brick:Zone .
+ex:pump1 a brick:Pump .
+ex:temp1 a brick:Temperature_Sensor ; brick:measures brick:Temperature .
+ex:site1 a brick:Site .
 """
 
+# Data (`ex:`) lives in its own namespace, as it does in real building graphs; the ontology
+# (`brick:`, `tag:`) is what gets stripped. `ex:site1` is named by a shape's sh:targetNode and
+# nothing else in the data, and `ex:`'s own owl:Ontology header is removed -- yet `ex:` stays,
+# since its real data outnumbers both.
 ONTOLOGY_TTL = """
-@prefix ex: <https://brickschema.org/schema/Brick#> .
+@prefix brick: <https://brickschema.org/schema/Brick#> .
+@prefix ex: <http://example.org/bldg#> .
 @prefix owl: <http://www.w3.org/2002/07/owl#> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
 @prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix tag: <https://brickschema.org/schema/BrickTag#> .
+ex: a owl:Ontology ; owl:imports <https://brickschema.org/schema/Brick> .
 <https://brickschema.org/schema/Brick> a owl:Ontology ; owl:imports <http://qudt.org/schema/qudt> .
-ex:VAV a owl:Class, sh:NodeShape ;
-    rdfs:subClassOf [ a owl:Restriction ; owl:onProperty ex:feeds ; owl:someValuesFrom ex:Zone ] ;
-    sh:property [ sh:path ex:feeds ; sh:in ( ex:zone1 ex:zone2 ) ] .
-ex:Zone a owl:Class .
-ex:feeds a owl:ObjectProperty ; rdfs:domain ex:VAV .
-ex:Metaclass rdfs:subClassOf rdfs:Class .
-ex:Pump a ex:Metaclass .
-ex:NumericValue sh:or ( [ sh:datatype ex:float ] [ sh:datatype ex:int ] ) .
+brick:VAV a owl:Class, sh:NodeShape ;
+    rdfs:subClassOf [ a owl:Restriction ; owl:onProperty brick:feeds ; owl:someValuesFrom brick:Zone ] ;
+    sh:property [ sh:path brick:feeds ; sh:in ( ex:zone1 ex:zone2 ) ] ;
+    brick:hasAssociatedTag tag:VAV .
+tag:VAV a brick:Tag ; rdfs:label "VAV" .
+brick:Zone a owl:Class .
+brick:feeds a owl:ObjectProperty ; rdfs:domain brick:VAV .
+brick:Metaclass rdfs:subClassOf rdfs:Class .
+brick:Pump a brick:Metaclass .
+brick:Temperature a brick:Quantity ; rdfs:label "Temperature" .
+brick:NumericValue sh:or ( [ sh:datatype brick:float ] [ sh:datatype brick:int ] ) .
+brick:SiteShape a sh:NodeShape ; sh:targetNode ex:site1 .
 """
 
 
@@ -205,8 +219,9 @@ def test_strip_ontology_leaves_exactly_the_instance_data():
     original_size = len(graph)
     removed = _strip_ontology(graph)
 
-    # Restriction/property-shape/list blank nodes go with their class; the data's own
-    # hasExternalReference blank nodes stay; typed instances of removed classes stay.
+    # Restriction/property-shape/list blank nodes go with their class, and the ontology's
+    # individuals (tag:VAV, brick:Temperature) with its namespaces; the data's own
+    # hasExternalReference blank nodes, and data that uses ontology terms, stay.
     assert removed == original_size - len(expected)
     assert isomorphic(graph, expected)
 
