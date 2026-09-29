@@ -156,3 +156,20 @@ async def test_summarize_schema_on_b59_binds_dataset_specific_namespace():
         ref_binding = re.search(r"@prefix ref: <([^>]+)>", summary["class_graph"])
         if ref_binding is not None:
             assert ref_binding.group(1) == "https://brickschema.org/schema/Brick/ref#"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("building", ["b59.ttl", "bldg11.ttl"])
+async def test_summarize_schema_exclude_ontology_drops_bundled_ontology(building):
+    # b59 carries a slice of 223P (s223:Class metaclass, shapes with sh:rule blank nodes);
+    # bldg11 bundles all of Brick (owl classes/properties, thousands of blank-node
+    # sh:TripleRules). Stripped, neither summary should still describe shapes or classes.
+    async with create_connected_server_and_client_session(mcp) as client:
+        await client.call_tool("load_dataset", {"name": "bldg", "path": str(EVAL_BUILDINGS_DIR / building)})
+        full = _result_json(await client.call_tool("summarize_schema", {"dataset": "bldg"}))
+        stripped = _result_json(await client.call_tool("summarize_schema", {"dataset": "bldg", "exclude_ontology": True}))
+
+        assert stripped["ontology_triples_removed"] > 0
+        assert "sh:NodeShape" in full["class_graph"]
+        for term in ("sh:NodeShape", "sh:PropertyShape", "owl:Class", "rdf:Property"):
+            assert term not in stripped["class_graph"]

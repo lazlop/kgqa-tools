@@ -12,7 +12,7 @@ that need to understand and query a knowledge graph.
   file) into memory under `name`. Replaces any dataset already loaded under that name.
 - **`list_datasets()`** — list loaded datasets with their format and triple count.
 - **`summarize_schema(dataset, iterations=10, similarity_threshold=0.3,
-  include_member_counts=False)`** — summarize the dataset's structure into a compact
+  include_member_counts=False, exclude_ontology=False)`** — summarize the dataset's structure into a compact
   `bs:`-namespaced class graph (via bschema), so an agent can see the graph's repeated patterns
   before writing any SPARQL against it. Call this **once** per dataset, right after
   `load_dataset`; the result is cached, so a repeat call is free but won't reflect changes until
@@ -21,7 +21,13 @@ that need to understand and query a knowledge graph.
   match, since real graphs rarely have perfectly identical instance patterns. Pass
   `include_member_counts=True` to also get `member_counts`, a mapping from each derived class's
   CURIE to how many real instances it collapsed (e.g. `{"bs:VAV_version_1": 50}`) — off by default to keep
-  the common-case response small.
+  the common-case response small. Pass `exclude_ontology=True` when the dataset bundles its
+  ontology (Brick, 223P, ...) alongside the instance data: classes (`owl:Class`/`rdfs:Class`, or
+  a metaclass subclassing one, like `s223:Class`), properties, SHACL shapes and ontology headers
+  are dropped before summarizing, along with the blank nodes hanging off them (restrictions,
+  property shapes, rules, lists), so the summary shows the data's patterns rather than the
+  ontology's. Instance data typed with those classes is kept, only the summary is affected
+  (`run_query` still sees everything), and the response adds `ontology_triples_removed`.
 - **`run_query(dataset, query, row_limit=3, connect=False, suggest_fixes=True)`** — the one tool
   for running queries, of any form (`SELECT`, `ASK`, `CONSTRUCT`, `DESCRIBE`). Returns the
   query's results (`variables`/`rows`, `result`, or `triples`, by `form`) *and* diagnoses it in

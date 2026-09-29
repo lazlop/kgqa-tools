@@ -9,8 +9,18 @@ import re
 
 import pytest
 from mcp.shared.memory import create_connected_server_and_client_session
+from rdflib import Graph
+from rdflib.compare import isomorphic
 
-from sparql_relax_mcp.server import TOOLSET_ENV_VAR, _datasets, _parse_toolset, _schema_summaries, build_server, mcp
+from sparql_relax_mcp.server import (
+    TOOLSET_ENV_VAR,
+    _datasets,
+    _parse_toolset,
+    _schema_summaries,
+    _strip_ontology,
+    build_server,
+    mcp,
+)
 
 # Uses the Brick namespace (rather than an arbitrary made-up one) because diagnose's
 # connection path search defaults to Brick/223P/RDFS/QUDT predicates only (see
@@ -158,6 +168,72 @@ async def test_summarize_schema_member_counts_is_opt_in():
         # The flag only adds a field -- it doesn't change anything else about the summary.
         assert with_counts["class_graph"] == without["class_graph"]
         assert with_counts["compression_pct"] == without["compression_pct"]
+
+
+ONTOLOGY_DATA_TTL = """
+@prefix ex: <https://brickschema.org/schema/Brick#> .
+ex:vav1 a ex:VAV ; ex:feeds ex:zone1 ; ex:hasExternalReference [ ex:id "vav-1" ] .
+ex:vav2 a ex:VAV ; ex:feeds ex:zone2 ; ex:hasExternalReference [ ex:id "vav-2" ] .
+ex:zone1 a ex:Zone .
+ex:zone2 a ex:Zone .
+ex:pump1 a ex:Pump .
+"""
+
+ONTOLOGY_TTL = """
+@prefix ex: <https://brickschema.org/schema/Brick#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+<https://brickschema.org/schema/Brick> a owl:Ontology ; owl:imports <http://qudt.org/schema/qudt> .
+ex:VAV a owl:Class, sh:NodeShape ;
+    rdfs:subClassOf [ a owl:Restriction ; owl:onProperty ex:feeds ; owl:someValuesFrom ex:Zone ] ;
+    sh:property [ sh:path ex:feeds ; sh:in ( ex:zone1 ex:zone2 ) ] .
+ex:Zone a owl:Class .
+ex:feeds a owl:ObjectProperty ; rdfs:domain ex:VAV .
+ex:Metaclass rdfs:subClassOf rdfs:Class .
+ex:Pump a ex:Metaclass .
+ex:NumericValue sh:or ( [ sh:datatype ex:float ] [ sh:datatype ex:int ] ) .
+"""
+
+
+def test_strip_ontology_leaves_exactly_the_instance_data():
+    graph = Graph()
+    graph.parse(data=ONTOLOGY_DATA_TTL + ONTOLOGY_TTL, format="turtle")
+    expected = Graph()
+    expected.parse(data=ONTOLOGY_DATA_TTL, format="turtle")
+
+    original_size = len(graph)
+    removed = _strip_ontology(graph)
+
+    # Restriction/property-shape/list blank nodes go with their class; the data's own
+    # hasExternalReference blank nodes stay; typed instances of removed classes stay.
+    assert removed == original_size - len(expected)
+    assert isomorphic(graph, expected)
+
+
+@pytest.mark.asyncio
+async def test_summarize_schema_exclude_ontology_is_opt_in_and_cached_separately():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await client.call_tool("load_dataset", {"name": "bundled", "data": ONTOLOGY_DATA_TTL + ONTOLOGY_TTL})
+        await client.call_tool("load_dataset", {"name": "data_only", "data": ONTOLOGY_DATA_TTL})
+
+        full = _result_json(await client.call_tool("summarize_schema", {"dataset": "bundled"}))
+        assert "ontology_triples_removed" not in full
+        assert "sh:NodeShape" in full["class_graph"]
+
+        stripped = _result_json(
+            await client.call_tool("summarize_schema", {"dataset": "bundled", "exclude_ontology": True})
+        )
+        assert stripped["ontology_triples_removed"] > 0
+        assert "owl:" not in stripped["class_graph"] and "sh:" not in stripped["class_graph"]
+        assert "Removed" in stripped["message"]
+        data_only = _result_json(await client.call_tool("summarize_schema", {"dataset": "data_only"}))
+        assert stripped["compression_pct"] == data_only["compression_pct"]
+
+        # Each flag value is cached on its own; the default call still returns the unstripped summary.
+        assert set(_schema_summaries["bundled"]) == {False, True}
+        again = _result_json(await client.call_tool("summarize_schema", {"dataset": "bundled"}))
+        assert again == full
 
 
 INSTANCE_NAME_TTL = """

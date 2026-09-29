@@ -47,8 +47,8 @@ from typing import Any, Callable, Literal, Optional
 
 from bschema_rs import create_bschema
 from mcp.server.fastmcp import FastMCP
-from rdflib import Graph
-from rdflib.namespace import RDFS
+from rdflib import BNode, Graph, URIRef
+from rdflib.namespace import OWL, RDF, RDFS, SH
 from sparql_relax import QueryResult, Store, Term
 
 _CORE_INSTRUCTIONS = (
@@ -100,8 +100,9 @@ class _Dataset:
 
 _datasets: dict[str, _Dataset] = {}
 
-_schema_summaries: dict[str, dict[str, Any]] = {}
-"""Cache of `summarize_schema` results, keyed by dataset name -- computing a bschema
+_schema_summaries: dict[str, dict[bool, dict[str, Any]]] = {}
+"""Cache of `summarize_schema` results, keyed by dataset name and then by its
+`exclude_ontology` flag (the two produce different summaries) -- computing a bschema
 class graph is real work (iterative graph relabeling), and the point of the tool is
 to be called once per dataset, so a repeat call should be free rather than
 recomputing. Cleared for a name whenever `load_dataset` replaces it."""
@@ -809,11 +810,80 @@ def list_datasets() -> list[dict[str, Any]]:
     return [{"name": name, "format": ds.format, "triple_count": ds.triple_count} for name, ds in sorted(_datasets.items())]
 
 
+_ONTOLOGY_TYPES: frozenset[URIRef] = frozenset({
+    RDFS.Class, OWL.Class, RDFS.Datatype,
+    RDF.Property, OWL.ObjectProperty, OWL.DatatypeProperty, OWL.AnnotationProperty, OWL.OntologyProperty,
+    OWL.FunctionalProperty, OWL.InverseFunctionalProperty, OWL.TransitiveProperty, OWL.SymmetricProperty,
+    OWL.AsymmetricProperty, OWL.ReflexiveProperty, OWL.IrreflexiveProperty,
+    OWL.Ontology,
+    SH.Shape, SH.NodeShape, SH.PropertyShape,
+})
+"""`rdf:type`s marking a subject as ontology rather than instance data, for
+`summarize_schema(exclude_ontology=True)` -- see `_strip_ontology`."""
+
+_ONTOLOGY_PREDICATES: frozenset[URIRef] = frozenset({
+    RDFS.subClassOf, RDFS.subPropertyOf, RDFS.domain, RDFS.range,
+    OWL.imports, OWL.deprecated, OWL.equivalentClass, OWL.equivalentProperty, OWL.inverseOf,
+})
+"""Predicates only an ontology term is ever the subject of, marking it as ontology even when
+it's missing an `rdf:type` from `_ONTOLOGY_TYPES` -- e.g. Brick's deprecated terms (only
+`owl:deprecated`) or an `owl:imports` header with no `owl:Ontology` type. Any predicate in the
+`sh:` namespace counts too (a shape declared only by its `sh:or`, say); see `_strip_ontology`."""
+
+
+def _strip_ontology(graph: Graph) -> int:
+    """Remove ontology definitions from `graph` in place, returning how many triples were removed.
+
+    A subject counts as ontology if it's typed with one of `_ONTOLOGY_TYPES` (or with a metaclass
+    the graph itself declares as a subclass of one, like 223P's `s223:Class rdfs:subClassOf
+    rdfs:Class`), or is the subject of one of `_ONTOLOGY_PREDICATES` or of any `sh:` predicate.
+    Every triple *about* such a subject is removed, plus the blank nodes reachable from it --
+    `owl:Restriction`s, `sh:property` shapes, `sh:rule`s, RDF lists -- since those only exist to
+    describe it. A blank node reached that way but still referenced by some kept subject is kept
+    (along with everything under it), so shared structure never leaves instance data dangling.
+    Triples that merely *use* an ontology term (`ex:vav1 a brick:VAV`) are untouched.
+    """
+    ontology_types = set(_ONTOLOGY_TYPES)
+    frontier = list(ontology_types)
+    while frontier:
+        for subclass in graph.subjects(RDFS.subClassOf, frontier.pop()):
+            if isinstance(subclass, URIRef) and subclass not in ontology_types:
+                ontology_types.add(subclass)
+                frontier.append(subclass)
+
+    shacl_ns = str(SH)
+    seeds = {s for t in ontology_types for s in graph.subjects(RDF.type, t)}
+    seeds.update(s for s, p, _ in graph if p in _ONTOLOGY_PREDICATES or p.startswith(shacl_ns))
+
+    reached: set[BNode] = set()
+    frontier = list(seeds)
+    while frontier:
+        for obj in graph.objects(frontier.pop(), None):
+            if isinstance(obj, BNode) and obj not in seeds and obj not in reached:
+                reached.add(obj)
+                frontier.append(obj)
+
+    removed = seeds | reached
+    changed = True
+    while changed:
+        changed = False
+        for node in [n for n in reached if n in removed]:
+            if any(referrer not in removed for referrer in graph.subjects(None, node)):
+                removed.discard(node)
+                changed = True
+
+    before = len(graph)
+    for node in removed:
+        graph.remove((node, None, None))
+    return before - len(graph)
+
+
 def summarize_schema(
     dataset: str,
     iterations: int = 10,
     similarity_threshold: Optional[float] = 0.3,
     include_member_counts: bool = False,
+    exclude_ontology: bool = False,
 ) -> dict[str, Any]:
     """Summarize `dataset`'s structure into a compact class graph (via bschema), so you can see
     its repeated patterns before writing SPARQL against it.
@@ -848,8 +918,18 @@ def summarize_schema(
     `run_query` round trip on a `COUNT` query just to find out. Off by default to keep the
     common-case response small; pass `True` when that count matters for what you're about to
     query.
+
+    `exclude_ontology` (default `False`) drops ontology definitions -- every class
+    (`owl:Class`/`rdfs:Class`, or a metaclass declared as a subclass of one, like `s223:Class`),
+    property (`rdf:Property` and the OWL property kinds), SHACL shape, and ontology header, along
+    with the blank-node structure hanging off them (restrictions, property shapes, rules, lists)
+    -- before summarizing. Pass `True` when the dataset bundles its ontology (e.g. Brick or
+    223P loaded alongside the instance data), so the summary shows the instance data's patterns
+    instead of the ontology's. Only the summary is affected: the loaded dataset itself, and so
+    `run_query`, still sees every triple. Instance data typed with those classes (`ex:vav1 a
+    brick:VAV`) is kept.
     """
-    cached = _schema_summaries.get(dataset)
+    cached = _schema_summaries.get(dataset, {}).get(exclude_ontology)
     if cached is None:
         ds = _datasets.get(dataset)
         if ds is None:
@@ -859,6 +939,7 @@ def summarize_schema(
         rdflib_format = _RDFLIB_FORMATS[ds.format]
         data_graph = Graph(store="Oxigraph")
         data_graph.parse(data=ds.data, format=rdflib_format)
+        ontology_triples_removed = _strip_ontology(data_graph) if exclude_ontology else 0
 
         # use_original_names=False: name each derived class after its members' shared rdf:type
         # (e.g. bs:VAV_version_1) instead of one arbitrary member's own IRI local name (e.g.
@@ -903,8 +984,9 @@ def summarize_schema(
             "member_counts": member_counts,
             "original_size": original_size,
             "class_graph_size": len(class_graph),
+            "ontology_triples_removed": ontology_triples_removed,
         }
-        _schema_summaries[dataset] = cached
+        _schema_summaries.setdefault(dataset, {})[exclude_ontology] = cached
 
     message = (
         f"Compressed {cached['original_size']} triples to {cached['class_graph_size']} "
@@ -916,6 +998,12 @@ def summarize_schema(
         "compression_pct": cached["compression_pct"],
         "iterations_run": cached["iterations_run"],
     }
+    if exclude_ontology:
+        result["ontology_triples_removed"] = cached["ontology_triples_removed"]
+        message += (
+            f" Removed {cached['ontology_triples_removed']} ontology triple(s) (class, property and "
+            "SHACL shape definitions) before summarizing; the triple counts above exclude them."
+        )
     if include_member_counts:
         result["member_counts"] = cached["member_counts"]
         message += " member_counts has each class's real instance count."
