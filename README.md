@@ -22,32 +22,31 @@ that need to understand and query a knowledge graph.
   `include_member_counts=True` to also get `member_counts`, a mapping from each derived class's
   CURIE to how many real instances it collapsed (e.g. `{"bs:VAV_version_1": 50}`) — off by default to keep
   the common-case response small.
-- **`diagnose(dataset, query, connect=False, sample_limit=3, suggest_fixes=True)`** — the tool
-  for almost every query. Run a SPARQL `SELECT` query and diagnose it. Cheap even when the query
-  already works (`ok: true`); when it doesn't, explains which triple pattern or `FILTER` is
-  broken. By default also returns up to `sample_limit` rows of the query's own result
-  (`sample_variables`/`sample_rows`, free since the full result is already computed to get the
-  row count) — enough for most purposes that `query` isn't needed at all. For each broken triple,
-  `suggest_fixes` (on by default, cheap) looks for the single most common cause — the query used
-  the right local name under the wrong namespace, or the right namespace with a mis-cased local
-  name — and reports it in that culprit's `suggested_fixes` only after actually substituting it
-  in and confirming the rerun returns rows; nothing is ever reported as fixed without being
-  verified first. Pass `connect=True` to *additionally* search the graph for a real connecting
-  path and propose a corrected query for a different class of problem (a genuinely wrong/missing
-  edge, not a namespace mismatch) — this part is **experimental**: it's slower, only looks within
-  a fixed set of namespaces, not guaranteed to find or verify a real fix, and doesn't support
-  `sample_limit`. Most agents get what they need from the default (`connect=False`) diagnosis —
-  `suggest_fixes` runs either way — and fix anything else themselves from there. A pathologically
-  stuck query is hard-killed after 30s and the internal worker is automatically restarted — you'll
-  see this as a `RuntimeError` naming the timeout, not a silent hang.
-- **`query(dataset, query, row_limit=3)`** — run any SPARQL query form (`SELECT`, `ASK`,
-  `CONSTRUCT`, `DESCRIBE`) and return the actual results. A fallback, not the default next step
-  after `diagnose` — reach for it when you need more rows than `diagnose`'s sample, when you're
-  after something specific (a particular room or VAV, say) that isn't in the sample and isn't
-  easily pinned down with a FILTER/VALUES clause of your own, or for `ASK`/`CONSTRUCT`/`DESCRIBE`,
-  which `diagnose` doesn't support at all. Defaults to just 3 rows — enough to confirm the query
-  returns what's expected without spending context on a full result set; pass a higher `row_limit`
-  (or `null`) once you actually need more.
+- **`run_query(dataset, query, row_limit=3, connect=False, suggest_fixes=True)`** — the one tool
+  for running queries, of any form (`SELECT`, `ASK`, `CONSTRUCT`, `DESCRIBE`). Returns the
+  query's results (`variables`/`rows`, `result`, or `triples`, by `form`) *and* diagnoses it in
+  the same call. Cheap even when the query already works (`ok: true`); when it doesn't, explains
+  which triple pattern or `FILTER` is broken. Returns just `row_limit` rows by default (3 —
+  enough to confirm the query returns what's expected without spending context on a full result
+  set); pass a higher value (or `null`) once you actually need more, or `0` for the diagnosis
+  alone. `row_count` is always the full count. For `ASK`/`CONSTRUCT`/`DESCRIBE`, the WHERE body
+  is diagnosed as `SELECT * WHERE { ... }` first — so a `false` ASK or an empty CONSTRUCT is
+  explained exactly like an empty SELECT — and then the original query is executed; a bare
+  `DESCRIBE <uri>` with no WHERE clause is just executed. If the diagnosis itself can't run (e.g.
+  a pattern of only all-variable triples like `?s ?p ?o`), the query still runs and the reason
+  is reported in `diagnosis_error`. For each broken triple, `suggest_fixes` (on by default,
+  cheap) looks for the single most common cause — the query used the right local name under the
+  wrong namespace, or the right namespace with a mis-cased local name — and reports it in that
+  culprit's `suggested_fixes` only after actually substituting it in and confirming the rerun
+  returns rows; nothing is ever reported as fixed without being verified first. Pass
+  `connect=True` to *additionally* search the graph for a real connecting path and propose a
+  corrected query for a different class of problem (a genuinely wrong/missing edge, not a
+  namespace mismatch) — this part is **experimental**: it's slower, only looks within a fixed set
+  of namespaces, and not guaranteed to find or verify a real fix. Most agents get what they need
+  from the default (`connect=False`) diagnosis — `suggest_fixes` runs either way — and fix
+  anything else themselves from there. Everything runs in a watchdog-guarded worker: a
+  pathologically stuck query is hard-killed after 30s and the worker is automatically restarted —
+  you'll see this as an error naming the timeout, not a silent hang.
 
 The default `extended` toolset (see [Choosing a toolset](#choosing-a-toolset)) adds two tools for
 exploring a graph before or between queries:
@@ -73,12 +72,10 @@ exploring a graph before or between queries:
   `more_beyond_max_depth` report when there's more than was returned.
 
 **Intended workflow:** `load_dataset`, then `summarize_schema` once to understand the graph's
-shape. From there, `diagnose` is the tool for almost every query — call it before trusting a
-query's result, even when you expect it to succeed; it's nearly free when the query works, tells
-you exactly what's wrong when it doesn't, and its `sample_rows` usually make a separate `query`
-call unnecessary. Reach for `query` only as a fallback (see above). Leave `connect` off by
-default; it's there for cases where an automatic suggested fix is worth the extra cost, not as
-the first thing to reach for.
+shape. From there, `run_query` for every query — it's nearly free when the query works, tells you
+exactly what's wrong when it doesn't, and raising `row_limit` is all it takes to get the full
+results. Leave `connect` off by default; it's there for cases where an automatic suggested fix is
+worth the extra cost, not as the first thing to reach for.
 
 ## What the output looks like
 
@@ -107,21 +104,25 @@ path/to/graph.ttl`. A few excerpts from a run against a tiny two-`Zone` S223 gra
 }
 ```
 
-`query` returns CURIEs, not full URIs, plus the legend that resolves them:
+`run_query` returns CURIEs, not full URIs, plus the legend that resolves them (diagnosis fields
+trimmed here):
 
 ```json
 {
+  "ok": true,
   "form": "solutions",
   "variables": ["zone"],
   "rows": [
     {"zone": {"type": "uri", "value": "s223:zone2"}},
     {"zone": {"type": "uri", "value": "s223:zone1"}}
   ],
-  "prefixes": {"s223": "http://data.ashrae.org/standard223#"}
+  "row_count": 2,
+  "prefixes": {"s223": "http://data.ashrae.org/standard223#"},
+  "message": "Query's pattern matched 2 row(s) with no issues found."
 }
 ```
 
-`diagnose` explains what's broken with the same abbreviated URIs the query itself used — and with
+On a broken query, `run_query` explains what's broken with the same abbreviated URIs the query itself used — and with
 `connect=True`, the suggested fix is still directly runnable even though it's abbreviated, because
 it carries its own `PREFIX` lines:
 
@@ -147,10 +148,10 @@ it carries its own `PREFIX` lines:
 ```
 
 `fallback_query_with_broken_triples_removed`/`connected_query` are meant to be pasted straight
-back into `query`/`diagnose`, not reconstructed by hand.
+back into `run_query`, not reconstructed by hand.
 
 For the single most common kind of broken triple — right local name, wrong namespace (or a
-mis-cased local name) — `diagnose` doesn't just explain it, it looks in the graph for the term you
+mis-cased local name) — `run_query` doesn't just explain it, it looks in the graph for the term you
 probably meant and verifies the fix by actually rerunning your query with it substituted in.
 Querying an S223 graph (which defines `s223:Zone`) for `rec:Zone` instead:
 
@@ -281,8 +282,8 @@ or pointed at a local clone instead:
 Every tool's description is sent to the agent on every turn, so each tool costs context. The
 server exposes one of two toolsets:
 
-- **`extended`** (default): all seven tools — the core five plus `search` and `traverse`.
-- **`core`**: just `load_dataset`, `list_datasets`, `summarize_schema`, `diagnose` and `query`.
+- **`extended`** (default): all six tools — the core four plus `search` and `traverse`.
+- **`core`**: just `load_dataset`, `list_datasets`, `summarize_schema` and `run_query`.
 
 Pick one with `--toolset` after the command, or with the `SPARQL_RELAX_TOOLSET` environment
 variable (the flag wins if both are set). The server's instructions to the agent change to match,

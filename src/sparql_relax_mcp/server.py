@@ -3,31 +3,29 @@
 
 Intended agent workflow: `load_dataset` once, then `summarize_schema` -- also just
 once, it's cached -- to see the graph's repeated structural patterns before writing
-any SPARQL against it. From there, `diagnose` is the tool for almost every query: it
-confirms the row count, explains *why* a broken query returns nothing or too few rows
--- which triple or FILTER is at fault -- and, since it samples a few rows of the
-query's own result for free, usually removes the need to call `query` at all. Reach
-for `query` only as a fallback: when a query needs more rows than the sample, or is
-after something specific -- a particular room or VAV, say -- that isn't among the
-sampled rows and isn't easily pinned down with a FILTER/VALUES clause added to the
-query itself. `diagnose`'s `connect=True` option additionally searches the graph's
-real edges for a corrected query, but that search is experimental (slower,
+any SPARQL against it. From there, `run_query` is the one tool for running queries,
+of any form (SELECT/ASK/CONSTRUCT/DESCRIBE): it returns the query's results (capped by
+`row_limit`), confirms the row count, and explains *why* a broken query returns nothing
+or too few rows -- which triple or FILTER is at fault. For non-SELECT queries, it
+diagnoses the WHERE body (rewritten as `SELECT *`) and then executes the original
+query. `run_query`'s `connect=True` option additionally searches the graph's real
+edges for a corrected query, but that search is experimental (slower,
 namespace-restricted, and not guaranteed to find or verify a real fix) -- most agents
 are better served by the default diagnosis and fixing the query themselves from its
 explanation.
 
 For the single most common broken-triple cause -- right local name, wrong namespace,
-or a mis-cased local name -- `diagnose` doesn't just explain it: by default it also
+or a mis-cased local name -- `run_query` doesn't just explain it: by default it also
 looks for another URI in the graph with the same local name, substitutes it in, and
 reruns, reporting the result in that culprit's `suggested_fixes` only once verified to
 actually return rows. See `_suggest_fixes_for_culprit`. This is unrelated to and much
 cheaper than `connect`, and runs regardless of it.
 
 The default `extended` toolset (see TOOLSETS) adds two exploration tools on top of
-those five: `search` (BM25 or regex over node names and string literals, for finding a
+those four: `search` (BM25 or regex over node names and string literals, for finding a
 URI before querying it) and `traverse` (a breadth-first walk from a node along chosen
 predicates, returned as a per-level DAG). `--toolset core` exposes only the original
-five, for when the extra tool descriptions aren't worth their context cost.
+four, for when the extra tool descriptions aren't worth their context cost.
 
 Every URI any tool returns is abbreviated to `prefix:local` (e.g. `s223:Zone`) rather
 than a full URI, using the dataset's own declared prefixes plus common defaults --
@@ -54,33 +52,30 @@ from rdflib.namespace import RDFS
 from sparql_relax import QueryResult, Store, Term
 
 _CORE_INSTRUCTIONS = (
-    "Tools for understanding and debugging SPARQL/RDF graphs. Load a graph with "
+    "Tools for understanding and querying SPARQL/RDF graphs. Load a graph with "
     "load_dataset, then call summarize_schema ONCE to see the graph's repeated structural "
     "patterns before writing any SPARQL against it -- it's cached, so calling it again is "
-    "free but adds nothing new. From there, diagnose is the tool for almost every query -- "
-    "ALWAYS call it before trusting a query's result. It's cheap even when the query already "
-    "works, explains exactly which triple or FILTER is broken when it doesn't, and by "
-    "default also samples a few rows of the query's own result for free -- for most purposes "
-    "that sample is enough, and you don't need query at all. Only reach for query as a "
-    "fallback: when you need more rows than the sample, or are after something specific (a "
-    "particular room or VAV, say) that isn't in the sample and isn't easily pinned down by "
-    "adding a FILTER/VALUES clause to the query yourself. diagnose's connect=True option "
-    "additionally tries to search the graph for a corrected query, but that search is "
-    "experimental and its suggestions should be verified, not trusted outright -- leave "
-    "connect off unless you specifically want to try it. Separately, and by default, diagnose "
-    "also checks each broken triple for the single most common mistake -- right local name, "
-    "wrong namespace, or a mis-cased local name -- and reports a verified fix (query rerun and "
-    "confirmed to return rows) in that culprit's suggested_fixes when one exists; this is "
-    "unrelated to and much cheaper than connect. Every URI any tool returns is abbreviated to "
-    "prefix:local (e.g. s223:Zone) using the dataset's declared prefixes plus common defaults "
-    "-- each response's own `prefixes` field lists exactly which bindings were used."
+    "free but adds nothing new. From there, run_query is the one tool for running any query "
+    "(SELECT/ASK/CONSTRUCT/DESCRIBE). It returns the query's results -- just 3 rows by "
+    "default; raise row_limit (or pass null) when you need more -- and, in the same call, "
+    "diagnoses it: cheap when the query works (ok=true), and when it doesn't, it explains "
+    "exactly which triple or FILTER is broken. run_query's connect=True option additionally "
+    "tries to search the graph for a corrected query, but that search is experimental and "
+    "its suggestions should be verified, not trusted outright -- leave connect off unless you "
+    "specifically want to try it. Separately, and by default, run_query also checks each "
+    "broken triple for the single most common mistake -- right local name, wrong namespace, "
+    "or a mis-cased local name -- and reports a verified fix (query rerun and confirmed to "
+    "return rows) in that culprit's suggested_fixes when one exists; this is unrelated to and "
+    "much cheaper than connect. Every URI any tool returns is abbreviated to prefix:local "
+    "(e.g. s223:Zone) using the dataset's declared prefixes plus common defaults -- each "
+    "response's own `prefixes` field lists exactly which bindings were used."
 )
 
 _EXTENDED_INSTRUCTIONS = _CORE_INSTRUCTIONS + (
     " When you don't yet know the URI for a concept (a class, a predicate, or a specific "
     "instance), use search to find it -- by keyword (mode='bm25', over local names, labels, "
     "comments and other string literals) or by regex -- instead of guessing names and letting "
-    "diagnose catch the guess. To walk a hierarchy or a chain of relations (up or down an "
+    "run_query catch the guess. To walk a hierarchy or a chain of relations (up or down an "
     "rdfs:subClassOf taxonomy, downstream along brick:feeds, ...), use traverse with a direction "
     "and a predicate list; it returns the reachable structure level by level, with every edge "
     "into each node, which a SPARQL property path's flat result doesn't show."
@@ -185,7 +180,7 @@ _PREFIX_SPARQL_RE = re.compile(r"PREFIX\s+([\w.-]*):\s*<([^>]+)>", re.IGNORECASE
 def _extract_declared_prefixes(text: str) -> dict[str, str]:
     """Pulls every `@prefix p: <uri> .` (Turtle/TriG) or `PREFIX p: <uri>` (SPARQL)
     declaration out of `text` via regex, without a full parse. Used both on a
-    dataset's raw source text (so `query`/`diagnose` output can use exactly the
+    dataset's raw source text (so `run_query` output can use exactly the
     prefixes that source already declares) and on a query string on its own (so a
     query using prefixes the dataset doesn't declare still round-trips). N-Triples/
     N-Quads/RDF-XML have no such lines and just yield an empty dict here, falling
@@ -257,9 +252,9 @@ def _prefix_declarations(prefix_names: set[str], prefixes: dict[str, str]) -> st
 
 
 def _make_runnable(query_text: Optional[str], prefixes: dict[str, str], used: set[str]) -> Optional[str]:
-    """Abbreviates a full, standalone query string (e.g. `diagnose`'s
+    """Abbreviates a full, standalone query string (e.g. `run_query`'s
     `connected_query`) and prepends the `PREFIX` lines it needs, so the result can be
-    pasted straight into `query`/`diagnose` without the caller having to reconstruct
+    pasted straight back into `run_query` without the caller having to reconstruct
     which prefixes it relies on. Unlike a bare triple/expression fragment, a
     standalone query is meaningless without its own prefixes attached.
 
@@ -285,7 +280,7 @@ def _make_runnable(query_text: Optional[str], prefixes: dict[str, str], used: se
 #  NAMESPACE-FIX SUGGESTIONS
 # ==============================================================================
 #
-# The most common reason a triple pattern turns up as a `diagnose` culprit isn't a
+# The most common reason a triple pattern turns up as a `run_query` culprit isn't a
 # structural mistake -- it's that the query used the right local name under the
 # wrong namespace (`brick:hasPoint` when the graph actually uses `s223:hasPoint`),
 # or the right namespace with a typo'd/mis-cased local name (`s223:zone` instead of
@@ -296,8 +291,8 @@ def _make_runnable(query_text: Optional[str], prefixes: dict[str, str], used: se
 #
 # This is cheap and safe enough to run by default (unlike `connect`): candidates
 # come from simple, single-triple-pattern SPARQL queries (no join, no cartesian
-# risk at all) run directly against the dataset's `Store` -- same as the plain
-# `query` tool, not routed through the diagnose watchdog worker -- and every
+# risk at all) run directly against the dataset's `Store` in-process, not routed
+# through the diagnose watchdog worker -- and every
 # candidate is only ever reported after empirically verifying it by substituting it
 # into the user's actual query and rerunning that modified query for real. Nothing
 # here is a guess dressed up as a fix.
@@ -305,11 +300,11 @@ def _make_runnable(query_text: Optional[str], prefixes: dict[str, str], used: se
 RDF_TYPE_URI = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
 
 MAX_FIX_ATTEMPTS_PER_DIAGNOSE = 6
-"""Global cap, across every culprit/triple/term in one `diagnose` call, on how many
+"""Global cap, across every culprit/triple/term in one `run_query` call, on how many
 candidate substitutions get rerun against the dataset to verify. Each rerun is a
 real SPARQL query with the same worst-case cost profile as the user's own query
 (bounded individually by `FIX_VERIFY_TIMEOUT`), so this exists to keep a single
-`diagnose` call's total added latency bounded even when several culprits each have
+`run_query` call's total added latency bounded even when several culprits each have
 several plausible-looking candidates -- most of which, for a graph with lots of
 near-miss local names, will fail verification and each cost up to the full timeout
 to rule out."""
@@ -447,7 +442,7 @@ def _substitute_uri_in_query(query_text: str, old_uri: str, new_uri: str) -> Opt
 
 
 class _FixAttemptBudget:
-    """Mutable counter shared across every culprit in one `diagnose` call, so
+    """Mutable counter shared across every culprit in one `run_query` call, so
     `MAX_FIX_ATTEMPTS_PER_DIAGNOSE` bounds the *total* number of verification
     reruns rather than being applied independently per culprit."""
 
@@ -600,12 +595,10 @@ def _require_dataset(name: str) -> Store:
 # used fork, and remains true now for a different reason (spawn simply
 # can't share the object at all).
 #
-# This deliberately does *not* also wrap the plain `query` tool: `query`
-# doesn't run the automatic ablation search that's the actual mechanism
-# behind a genuine Rust-side hang -- a hand-crafted disconnected query
-# passed to `query` directly is comparatively rare, and adding worker-
-# process overhead to the tool that's supposed to be the cheap, ordinary
-# path isn't worth guarding against it.
+# `run_query` also executes queries through this same worker (the worker just
+# dispatches `Store.query` like any other method), so plain execution of a
+# SELECT under `connect=True`, or of an ASK/CONSTRUCT/DESCRIBE, gets the same
+# hard-timeout protection as the diagnosis itself.
 
 DIAGNOSE_HARD_TIMEOUT_SECONDS = 30.0
 """Wall-clock cap per diagnose/diagnose_and_connect call, enforced by killing and
@@ -780,7 +773,7 @@ def _term_to_json(term: Optional[Term], prefixes: dict[str, str], used: set[str]
 
 
 def load_dataset(name: str, data: Optional[str] = None, path: Optional[str] = None, format: str = "turtle") -> dict[str, Any]:
-    """Load RDF data into memory as a named dataset for `diagnose`/`query` to run against.
+    """Load RDF data into memory as a named dataset for `run_query` to run against.
 
     Pass exactly one of `data` (the RDF text itself) or `path` (an absolute path to a local RDF
     file to read) -- not both. `format` is one of "turtle" (default), "ntriples", "nquads",
@@ -788,7 +781,7 @@ def load_dataset(name: str, data: Optional[str] = None, path: Optional[str] = No
 
     Loading a dataset under a `name` that's already loaded replaces it.
 
-    `diagnose`/`query` abbreviate every URI they return to `prefix:local` rather than a full URI,
+    `run_query` abbreviates every URI it returns to `prefix:local` rather than a full URI,
     using this dataset's own declared prefixes plus common defaults for ontologies it doesn't
     declare (each response's own `prefixes` field says exactly which of those were used). The
     `declared_prefixes` returned here is just the dataset's own -- worth a glance up front so you
@@ -825,8 +818,8 @@ def summarize_schema(
     """Summarize `dataset`'s structure into a compact class graph (via bschema), so you can see
     its repeated patterns before writing SPARQL against it.
 
-    Call this ONCE per dataset, right after `load_dataset` and before your first `diagnose`/
-    `query` call -- knowing the graph's shape up front is what makes it possible to write a
+    Call this ONCE per dataset, right after `load_dataset` and before your first `run_query`
+    call -- knowing the graph's shape up front is what makes it possible to write a
     plausible query on the first try instead of guessing at predicates and class names. The
     result is cached, so calling it again for the same dataset is free but returns the same
     summary; it won't reflect changes until `load_dataset` reloads that name.
@@ -852,7 +845,7 @@ def summarize_schema(
     derived class's CURIE (as it appears in `class_graph`) to how many real instances it
     collapsed, e.g. `{"bs:VAV_version_1": 50, "bs:AHU_version_1": 4}` -- lets you tell how many
     of a given pattern actually exist (4 AHUs? 51 zones?) without spending a separate
-    `diagnose`/`query` round trip on a `COUNT` query just to find out. Off by default to keep the
+    `run_query` round trip on a `COUNT` query just to find out. Off by default to keep the
     common-case response small; pass `True` when that count matters for what you're about to
     query.
     """
@@ -916,7 +909,7 @@ def summarize_schema(
     message = (
         f"Compressed {cached['original_size']} triples to {cached['class_graph_size']} "
         f"({cached['compression_pct']:.1f}%) in {cached['iterations_run']} iteration(s). Use "
-        "class_graph to understand the graph's structure, then call diagnose on your queries."
+        "class_graph to understand the graph's structure, then call run_query on your queries."
     )
     result = {
         "class_graph": cached["class_graph"],
@@ -930,66 +923,129 @@ def summarize_schema(
     return result
 
 
-def diagnose(
+_IRIREF_RE = re.compile(r'<[^<>"{}|^`\\\x00-\x20]*>')
+_STRING_RE = re.compile(
+    r'"""(?:[^"\\]|\\.|"(?!""))*"""'
+    r"|'''(?:[^'\\]|\\.|'(?!''))*'''"
+    r'|"(?:[^"\\\n]|\\.)*"'
+    r"|'(?:[^'\\\n]|\\.)*'",
+    re.S,
+)
+_QUERY_FORM_RE = re.compile(r"(?<![\w:?$])(SELECT|ASK|CONSTRUCT|DESCRIBE)(?![\w:\-])", re.I)
+
+_UNLIMITED_ROWS = 2**63 - 1
+"""Stand-in for "no limit" when handing `row_limit=None` to `Store.diagnose`, whose
+`sample_limit` is a Rust `usize` and doesn't accept `None`."""
+
+
+def _mask_sparql(text: str) -> str:
+    """Returns `text` with every string literal, IRIREF and comment blanked out to spaces
+    (same length, so indices still line up with `text`) -- lets `_query_form`/
+    `_as_select_over_where_body` find keywords and braces with plain regex/brace matching
+    without tripping over a `{` inside a literal or a `#` inside an IRI."""
+    out = list(text)
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c == "#":
+            j = text.find("\n", i)
+            j = len(text) if j == -1 else j
+        elif c in "\"'":
+            m = _STRING_RE.match(text, i)
+            j = m.end() if m else i + 1
+        elif c == "<" and (m := _IRIREF_RE.match(text, i)):
+            j = m.end()
+        else:
+            i += 1
+            continue
+        out[i:j] = " " * (j - i)
+        i = j
+    return "".join(out)
+
+
+def _match_brace(masked: str, open_idx: int) -> int:
+    depth = 0
+    for i in range(open_idx, len(masked)):
+        if masked[i] == "{":
+            depth += 1
+        elif masked[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _query_form(query: str) -> Optional[str]:
+    """`"SELECT"`/`"ASK"`/`"CONSTRUCT"`/`"DESCRIBE"`, or `None` if none is found (left for
+    the query engine itself to reject with a real parse error)."""
+    m = _QUERY_FORM_RE.search(_mask_sparql(query))
+    return m.group(1).upper() if m else None
+
+
+def _as_select_over_where_body(query: str) -> Optional[str]:
+    """Rewrites an ASK/CONSTRUCT/DESCRIBE query into `SELECT * WHERE { <its WHERE body> }`
+    (same prologue, same trailing solution modifiers), so `Store.diagnose` -- SELECT-only --
+    can explain why that body matches nothing. `None` when there's no body to diagnose (a
+    bare `DESCRIBE <uri>`) or the query's shape isn't recognized. The dataset clauses
+    (`FROM`) of CONSTRUCT/DESCRIBE are dropped -- this server's stores have a single default
+    graph anyway."""
+    masked = _mask_sparql(query)
+    m = _QUERY_FORM_RE.search(masked)
+    if m is None:
+        return None
+    form = m.group(1).upper()
+    prologue = query[: m.start()]
+    if form == "ASK":
+        return prologue + "SELECT *" + query[m.end() :]
+    if form not in ("CONSTRUCT", "DESCRIBE"):
+        return None
+    pos = m.end()
+    if form == "CONSTRUCT":
+        template_start = len(masked[pos:]) - len(masked[pos:].lstrip()) + pos
+        if masked.startswith("{", template_start):
+            template_end = _match_brace(masked, template_start)
+            if template_end < 0:
+                return None
+            pos = template_end + 1
+    body_start = masked.find("{", pos)
+    if body_start < 0:
+        return None
+    return prologue + "SELECT * WHERE " + query[body_start:]
+
+
+def run_query(
     dataset: str,
     query: str,
+    row_limit: Optional[int] = 3,
     connect: bool = False,
-    sample_limit: int = 3,
     suggest_fixes: bool = True,
 ) -> dict[str, Any]:
-    """Run a SPARQL SELECT query against `dataset` and diagnose it. This is the tool to reach for
-    for almost every query -- call it before trusting a query's result, even when you expect it
-    to succeed.
+    """Run any SPARQL query (SELECT/ASK/CONSTRUCT/DESCRIBE) against `dataset`, returning its
+    results *and* a diagnosis of why it returns nothing when it's broken. This is the one tool
+    for running queries -- there's no separate "just execute" tool, and none is needed: on a
+    working query the diagnosis is nearly free and comes back as `ok: true` with no culprits.
 
-    On a working query this is nearly free: it just confirms the row count (`ok: true`) and, since
-    `sample_limit > 0` by default, includes a preview of the actual result rows in
-    `sample_variables`/`sample_rows` at no extra cost -- for most purposes that preview is enough
-    to confirm the query returns what you expect, and you don't need `query` at all. On a query
-    that returns nothing, or fewer rows than expected, this explains *why* instead -- which BGP
-    triple(s) or FILTER(s) are responsible. If `connect=True`, it also searches the graph's actual
-    edges for a real connecting path, often finding a corrected query that actually returns rows
-    (see `connected_query` on each culprit).
+    Results come back shaped by the query's form (`form`): `"solutions"` (SELECT) with
+    `variables`/`rows`, `"boolean"` (ASK) with `result`, or `"graph"` (CONSTRUCT/DESCRIBE) with
+    `triples`. `row_limit` (default 3) caps how many rows/triples are returned -- enough to
+    confirm the query returns what you expect without spending context on a full result set.
+    Pass a higher value, or `null` for no limit, once you actually need the results (e.g. to hand
+    them back to the user), or `0` for the diagnosis alone. It has no effect on ASK, and never
+    affects `row_count`, which is always the full count.
 
-    Note: Connection is experimental. For AI agents, it is often more effective to use
-    diagnose with `connect=False`, then allow the agent to correct the query itself based
-    on the diagnosis.
+    `row_count` counts solutions of the query's WHERE pattern: for SELECT, that's its own rows;
+    for ASK/CONSTRUCT/DESCRIBE, the query is diagnosed as `SELECT * WHERE { <its WHERE body> }`
+    first (so an ASK that's `false`, or a CONSTRUCT that builds nothing, is explained the same
+    way an empty SELECT is), then the original query itself is executed for `result`/`triples`.
+    A bare `DESCRIBE <uri>` with no WHERE clause has nothing to diagnose and is just executed
+    (`row_count: null`). If the diagnosis itself can't run -- e.g. the pattern is only
+    all-variable triples like `?s ?p ?o`, which there's nothing to ablate in -- the query is still
+    executed and the reason is reported in `diagnosis_error`.
 
-    Only SELECT queries can be diagnosed (ASK/CONSTRUCT/DESCRIBE aren't supported here -- use
-    `query` directly for those). Reach for `query` instead of relying on `sample_rows` only when
-    you need more rows than `sample_limit`, or you're after something specific -- a particular
-    room or VAV, say -- that isn't among the sampled rows and isn't easily pinned down by adding
-    a FILTER/VALUES clause to this query yourself.
-
-    `sample_limit` (default 3) caps how many rows of the query's own result are included in
-    `sample_variables`/`sample_rows`, shaped like `query`'s own `variables`/`rows` -- free to
-    include since the full result is already computed here to get the row count anyway. Pass `0`
-    to skip it. Only honored when `connect=False`; `diagnose_and_connect` doesn't support it, so
-    `sample_variables`/`sample_rows` are always empty when `connect=True`.
-
-    Once the query already returns at least one row, the (combinatorial, and by far the most
-    expensive part of this call) triple/filter search is skipped entirely -- diagnosis comes back
-    immediately with `ok=true` and no culprits, since `row_count`/`sample_rows` already cost the
-    one query run this call always makes anyway. Only a query that returns nothing (or the
-    `connect=True` path, which always runs the full search regardless) triggers that search.
-
-    When `connect=True`, path search defaults to predicates in the Brick, ASHRAE 223P, RDFS,
-    and QUDT namespaces (this tool's usual building-automation domain) -- a real fix outside
-    those namespaces won't be found, though the diagnosis of *which* triple is broken
-    is unaffected.
-
-    Some triple combinations would force the query engine to materialize a full N x M cross
-    product before yielding a single row -- this call always skips those instead of checking them
-    (reported separately in `cartesian_risks_skipped`, not proof either way), since nothing can
-    force a stuck check to give up early and an MCP caller shouldn't risk a hung evaluation just
-    to isolate one more culprit.
-
-    Every URI in the result -- in `sample_rows`, `culprits`, `connected_query`,
-    `fallback_query_with_broken_triples_removed`, everywhere -- is abbreviated to `prefix:local`
-    (e.g. `s223:Zone`) rather than returned in full, using this dataset's own declared prefixes
-    plus common defaults for ontologies it doesn't declare. `connected_query`/
-    `fallback_query_with_broken_triples_removed` are still directly runnable as-is: each has its
-    own needed `PREFIX` lines prepended. The top-level `prefixes` field lists exactly which
-    prefix -> URI bindings were used anywhere in this response.
+    On a query whose pattern matches nothing, or fewer rows than expected, `culprits`/
+    `filter_issues` explain *why* -- which BGP triple(s) or FILTER(s) are responsible. Once the
+    pattern already matches at least one row, the (combinatorial, by far the most expensive)
+    triple/filter search is skipped entirely, so a working query costs one query run.
 
     `suggest_fixes` (default `True`) targets the single most common reason a triple pattern is
     broken: the query used the right local name under the wrong namespace (`brick:hasPoint` when
@@ -998,11 +1054,28 @@ def diagnose(
     sharing the broken term's local name and *verifies* it by actually substituting it into your
     query and rerunning -- nothing appears in a culprit's `suggested_fixes` unless that rerun
     confirmed it returns rows. Each entry's `fixed_query` is directly runnable (own `PREFIX` lines
-    included, same as `connected_query`). This is unrelated to `connect`, much cheaper, and runs
-    regardless of it -- `connect`'s graph-edge search looks for a different failure mode entirely
-    (a genuinely wrong/missing edge, not a namespace mismatch) and doesn't target this one
-    specifically. Pass `False` to skip it if you don't want the extra (small, timeout-bounded)
-    query reruns.
+    included). Pass `False` to skip it if you don't want the extra (small, timeout-bounded) reruns.
+
+    If `connect=True`, it also searches the graph's actual edges for a real connecting path,
+    often finding a corrected query that actually returns rows (see `connected_query` on each
+    culprit). This is experimental: slower, and restricted to predicates in the Brick, ASHRAE
+    223P, RDFS and QUDT namespaces (a real fix outside those won't be found, though the diagnosis
+    of *which* triple is broken is unaffected). For AI agents it's usually more effective to leave
+    `connect` off and correct the query yourself from the diagnosis.
+
+    Some triple combinations would force the query engine to materialize a full N x M cross
+    product before yielding a single row -- this call always skips those instead of checking them
+    (reported separately in `cartesian_risks_skipped`, not proof either way). Everything runs in a
+    watchdog-guarded worker process, so a query that hangs the engine is killed after 30s and
+    reported as an error rather than hanging the server.
+
+    Every URI in the result -- in `rows`, `triples`, `culprits`, `connected_query`,
+    `fallback_query_with_broken_triples_removed`, everywhere -- is abbreviated to `prefix:local`
+    (e.g. `s223:Zone`) rather than returned in full, using this dataset's own declared prefixes
+    plus common defaults for ontologies it doesn't declare. `connected_query`/`fixed_query`/
+    `fallback_query_with_broken_triples_removed` are still directly runnable as-is: each has its
+    own needed `PREFIX` lines prepended. The top-level `prefixes` field lists exactly which
+    prefix -> URI bindings were used anywhere in this response.
     """
     _require_dataset(dataset)  # fail fast with a clear error before involving the watchdog worker at all
     entry = _datasets[dataset]
@@ -1023,10 +1096,18 @@ def diagnose(
             used_prefixes.add(prefix)
         return curie
 
+    form = _query_form(query)
+    is_select = form == "SELECT"
+    diagnosed_query = query if is_select else _as_select_over_where_body(query)
+    rows_limit = _UNLIMITED_ROWS if row_limit is None else row_limit
+
     def _fixes_for(raw_triples: list[str]) -> list[dict[str, Any]]:
-        if not suggest_fixes:
+        # Fixes are verified by rerunning the query with a term substituted, which needs a
+        # SELECT -- so for a non-SELECT query they're found and reported against the rewritten
+        # `SELECT * WHERE { ... }` form (still runnable, just not the original query form).
+        if not suggest_fixes or diagnosed_query is None:
             return []
-        raw_fixes = _suggest_fixes_for_culprit(store, query, raw_triples, fix_budget)
+        raw_fixes = _suggest_fixes_for_culprit(store, diagnosed_query, raw_triples, fix_budget)
         return [
             {
                 "kind": f["kind"],
@@ -1039,10 +1120,32 @@ def diagnose(
         ]
 
     worker = _get_diagnose_worker()
+    report = None
+    diagnosis_error: Optional[str] = None
+    culprits: list[dict[str, Any]] = []
+    filter_issues: list[dict[str, Any]] = []
+    cartesian_risks: list[Any] = []
+    sampled: Optional[tuple[list[str], list[list[Optional[Term]]]]] = None
+
     # MCP callers never opt into ignoring cartesian risk or expanding a nonempty result's search
     # -- both are hardcoded here rather than exposed as parameters (see the docstring).
-    if connect:
-        report = worker.call(dataset, "diagnose_and_connect", query, ignore_cartesian_risk=False)
+    if diagnosed_query is not None:
+        try:
+            if connect:
+                report = worker.call(dataset, "diagnose_and_connect", diagnosed_query, ignore_cartesian_risk=False)
+            else:
+                report = worker.call(
+                    dataset,
+                    "diagnose",
+                    diagnosed_query,
+                    ignore_cartesian_risk=False,
+                    sample_limit=rows_limit if is_select else 0,
+                    expand_nonempty_results=False,
+                )
+        except RuntimeError as exc:
+            diagnosis_error = str(exc)
+
+    if report is not None and connect:
         culprits = [
             {
                 "depth": result.found_at_depth,
@@ -1061,17 +1164,7 @@ def diagnose(
             for f in report.filter_results
         ]
         cartesian_risks = report.cartesian_risks
-        sample_variables: list[str] = []
-        sample_rows: list[dict[str, Any]] = []
-    else:
-        report = worker.call(
-            dataset,
-            "diagnose",
-            query,
-            ignore_cartesian_risk=False,
-            sample_limit=sample_limit,
-            expand_nonempty_results=False,
-        )
+    elif report is not None:
         culprits = [
             {
                 "depth": c.depth,
@@ -1090,83 +1183,115 @@ def diagnose(
             for f in report.filter_culprits
         ]
         cartesian_risks = report.cartesian_risks
-        sample_variables = report.sample_variables
-        sample_rows = [
-            {var: _term_to_json(term, prefixes, used_prefixes) for var, term in zip(sample_variables, row)}
-            for row in report.sample_rows
-        ]
+        if is_select:
+            # diagnose already ran the query in full to count it, so its sample *is* the result.
+            sampled = (report.sample_variables, report.sample_rows)
+
+    result: dict[str, Any]
+    if sampled is not None:
+        variables, raw_rows = sampled
+        result = {
+            "form": "solutions",
+            "variables": variables,
+            "rows": [
+                {var: _term_to_json(term, prefixes, used_prefixes) for var, term in zip(variables, row)}
+                for row in raw_rows
+            ],
+        }
+    else:
+        executed: QueryResult = worker.call(dataset, "query", query, row_limit=rows_limit)
+        if executed.form == "boolean":
+            result = {"form": "boolean", "result": executed.boolean}
+        elif executed.form == "solutions":
+            result = {
+                "form": "solutions",
+                "variables": executed.variables,
+                "rows": [
+                    {var: _term_to_json(term, prefixes, used_prefixes) for var, term in row.items()}
+                    for row in executed.bindings
+                ],
+            }
+        else:
+            result = {
+                "form": "graph",
+                "triples": [
+                    {
+                        "subject": _term_to_json(s, prefixes, used_prefixes),
+                        "predicate": _term_to_json(p, prefixes, used_prefixes),
+                        "object": _term_to_json(o, prefixes, used_prefixes),
+                    }
+                    for s, p, o in (executed.triples or [])
+                ],
+            }
 
     cartesian_risks_skipped = [
         {"triples": [_abbrev(t) for t in r.triples], "depth": r.depth} for r in cartesian_risks
     ]
-
+    row_count = report.original_row_count if report is not None else None
     fixed_culprit_count = sum(1 for c in culprits if c["suggested_fixes"])
 
-    ok = report.original_row_count > 0 and not culprits and not filter_issues
-    if ok:
-        if sample_rows:
-            message = (
-                f"Query returned {report.original_row_count} row(s) with no issues found. "
-                f"sample_rows has {len(sample_rows)} of them for a quick check -- call `query` only if "
-                "you need more rows, or a specific value these samples don't include."
-            )
+    if report is None:
+        ok = diagnosis_error is None
+        if diagnosed_query is None:
+            message = "Query executed; it has no WHERE pattern to diagnose."
         else:
-            message = f"Query returned {report.original_row_count} row(s) with no issues found. Call `query` to fetch the results."
-    elif culprits or filter_issues:
-        if fixed_culprit_count:
-            message = (
-                f"Query is broken, but {fixed_culprit_count} culprit(s) have a verified fix in their own "
-                "`suggested_fixes` -- each `fixed_query` there was actually rerun and confirmed to return rows."
-            )
-        elif connect:
-            message = (
-                "Query is broken. See `culprits`/`filter_issues` for what's wrong, and `connected_query` "
-                "on any culprit where a fix was found."
-            )
-        else:
-            message = (
-                "Query is broken. See `culprits`/`filter_issues` for what's wrong. Call again with "
-                "`connect=true` to search for a corrected query."
-            )
-    elif cartesian_risks_skipped:
-        message = (
-            "Query returned 0 rows and no broken triple/filter could be isolated, but "
-            f"{len(cartesian_risks_skipped)} combination(s) were skipped rather than checked (see "
-            "`cartesian_risks_skipped`) to avoid materializing a full cross product -- the real "
-            "culprit may be among them."
-        )
+            message = f"Query executed, but couldn't be diagnosed ({diagnosis_error}) -- check its results yourself."
     else:
-        message = (
-            "Query returned 0 rows and no single broken triple/filter could be isolated -- the "
-            "issue may be structural (e.g. two jointly-broken triples beyond the search depth, or "
-            "an unbound variable) rather than one clear culprit."
-        )
+        ok = report.original_row_count > 0 and not culprits and not filter_issues
+        if ok:
+            message = f"Query's pattern matched {report.original_row_count} row(s) with no issues found."
+            if result["form"] != "boolean" and row_limit is not None and report.original_row_count > row_limit:
+                message += f" Only {row_limit} returned (row_limit) -- raise it, or pass null, if you need more."
+        elif culprits or filter_issues:
+            if fixed_culprit_count:
+                message = (
+                    f"Query is broken, but {fixed_culprit_count} culprit(s) have a verified fix in their own "
+                    "`suggested_fixes` -- each `fixed_query` there was actually rerun and confirmed to return rows."
+                )
+            elif connect:
+                message = (
+                    "Query is broken. See `culprits`/`filter_issues` for what's wrong, and `connected_query` "
+                    "on any culprit where a fix was found."
+                )
+            else:
+                message = (
+                    "Query is broken. See `culprits`/`filter_issues` for what's wrong. Call again with "
+                    "`connect=true` to search for a corrected query."
+                )
+        elif cartesian_risks_skipped:
+            message = (
+                "Query's pattern matched 0 rows and no broken triple/filter could be isolated, but "
+                f"{len(cartesian_risks_skipped)} combination(s) were skipped rather than checked (see "
+                "`cartesian_risks_skipped`) to avoid materializing a full cross product -- the real "
+                "culprit may be among them."
+            )
+        else:
+            message = (
+                "Query's pattern matched 0 rows and no single broken triple/filter could be isolated -- the "
+                "issue may be structural (e.g. two jointly-broken triples beyond the search depth, or "
+                "an unbound variable) rather than one clear culprit."
+            )
 
     return {
         "ok": ok,
-        "row_count": report.original_row_count,
-        "sample_variables": sample_variables,
-        "sample_rows": sample_rows,
+        **result,
+        "row_count": row_count,
         "culprits": culprits,
         "filter_issues": filter_issues,
         "cartesian_risks_skipped": cartesian_risks_skipped,
+        "diagnosis_error": diagnosis_error,
         "prefixes": {p: prefixes[p] for p in sorted(used_prefixes)},
         "message": message,
     }
 
 
 def query(dataset: str, query: str, row_limit: Optional[int] = 3) -> dict[str, Any]:
-    """Run any SPARQL query (SELECT/ASK/CONSTRUCT/DESCRIBE) against `dataset` and return its
-    actual results.
+    """Run any SPARQL query (SELECT/ASK/CONSTRUCT/DESCRIBE) against `dataset` in-process and
+    return its actual results, with no diagnosis.
 
-    This is a fallback, not the default next step after `diagnose` -- `diagnose`'s own
-    `sample_rows` already gives you a free peek at a working SELECT query's results, which is
-    enough for most purposes. Reach for `query` instead when you need more rows than the sample,
-    when you're after something specific (a particular room or VAV, say) that isn't in the sample
-    and isn't easily pinned down by adding a FILTER/VALUES clause to the query yourself, or for
-    ASK/CONSTRUCT/DESCRIBE queries, which `diagnose` doesn't support at all. Still call `diagnose`
-    first on any new SELECT query -- it's cheap even when the query works, and it catches broken
-    queries with an actionable explanation instead of a bare empty result.
+    No longer exposed as an MCP tool -- `run_query` covers everything this does (all four query
+    forms, any `row_limit`) plus the diagnosis, and runs behind the watchdog. Kept as a plain
+    function for direct Python callers.
 
     `row_limit` caps how many rows a SELECT/CONSTRUCT/DESCRIBE result may return (default 3 --
     enough to confirm the query returns what you expect without spending context on a full result
@@ -1430,7 +1555,7 @@ def _display_curie(uri: str, prefixes: dict[str, str], used: set[str]) -> str:
 # ==============================================================================
 #
 # Nothing else here answers "what's the URI for X?" -- `summarize_schema` shows the
-# graph's shape and `diagnose`/`query` need terms the agent already knows. `search`
+# graph's shape and `run_query` needs terms the agent already knows. `search`
 # indexes every named (non-blank) node once per dataset as a small text document:
 # its local name split into words (`Supply_Air_Temperature_Sensor`, `hasPoint`,
 # `AHU01` -> supply air temperature sensor / has point / ahu 01 -- without this
@@ -1681,13 +1806,13 @@ def search(
 #
 # Every tool's description is sent to the agent on every turn, so each tool costs
 # context whether or not it's used. The toolset picks which tools get registered:
-# `core` is the original five; `extended` (the default) adds `search` and
+# `core` is the original four; `extended` (the default) adds `search` and
 # `traverse`. The server-level instructions change with it, so a `core` agent is
 # never told about tools it doesn't have.
 
 TOOLSETS: dict[str, tuple[Callable[..., Any], ...]] = {
-    "core": (load_dataset, list_datasets, summarize_schema, diagnose, query),
-    "extended": (load_dataset, list_datasets, summarize_schema, diagnose, query, search, traverse),
+    "core": (load_dataset, list_datasets, summarize_schema, run_query),
+    "extended": (load_dataset, list_datasets, summarize_schema, run_query, search, traverse),
 }
 _TOOLSET_INSTRUCTIONS = {"core": _CORE_INSTRUCTIONS, "extended": _EXTENDED_INSTRUCTIONS}
 DEFAULT_TOOLSET = "extended"
@@ -1716,7 +1841,7 @@ def _parse_toolset(argv: Optional[list[str]] = None) -> str:
         choices=sorted(TOOLSETS),
         default=None,
         help=f"which tools to expose (default: ${TOOLSET_ENV_VAR} if set, else {DEFAULT_TOOLSET!r}). "
-        "'core' is load_dataset/list_datasets/summarize_schema/diagnose/query; 'extended' adds search and traverse.",
+        "'core' is load_dataset/list_datasets/summarize_schema/run_query; 'extended' adds search and traverse.",
     )
     args = parser.parse_args(argv)
     toolset = args.toolset or os.environ.get(TOOLSET_ENV_VAR) or DEFAULT_TOOLSET
