@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Calls each `sparql_relax_mcp` tool in turn and pretty-prints its input and output,
 so you can eyeball what an agent actually sees -- CURIEs instead of full URIs, the
-`prefixes` legend, a `diagnose --connect` fix that's still directly runnable, a
+`prefixes` legend, a `run_query --connect` fix that's still directly runnable, a
 verified `suggest_fixes` namespace correction, etc.
 
 Calls the tool functions directly (they're plain Python functions under the
@@ -78,24 +78,25 @@ def main() -> None:
     _call("summarize_schema", s.summarize_schema, dataset="demo")
 
     working_query = "PREFIX s223: <http://data.ashrae.org/standard223#> SELECT ?zone WHERE { ?zone a s223:Zone }"
-    _call("diagnose (working query)", s.diagnose, dataset="demo", query=working_query)
+    _call("run_query (working query)", s.run_query, dataset="demo", query=working_query)
 
     broken_query = (
         "PREFIX s223: <http://data.ashrae.org/standard223#>\n"
         "PREFIX brick: <https://brickschema.org/schema/Brick#>\n"
         "SELECT ?zone ?sensor WHERE { ?zone a s223:Zone . ?zone brick:hasPoint ?sensor . }"
     )
-    _call("diagnose (broken query)", s.diagnose, dataset="demo", query=broken_query)
-    _call("diagnose (broken query, connect=True)", s.diagnose, dataset="demo", query=broken_query, connect=True)
+    _call("run_query (broken query)", s.run_query, dataset="demo", query=broken_query)
+    _call("run_query (broken query, connect=True)", s.run_query, dataset="demo", query=broken_query, connect=True)
 
     # brick:hasPoint above has no same-local-name match anywhere in the sample graph
     # (it's not a Brick graph), so suggest_fixes correctly finds nothing for it. This
     # one instead makes the exact mistake suggest_fixes targets: s223:Zone exists,
     # but the query used rec:Zone (right local name, wrong namespace).
     wrong_namespace_query = "PREFIX rec: <https://w3id.org/rec#> SELECT ?zone WHERE { ?zone a rec:Zone }"
-    _call("diagnose (wrong namespace -- suggest_fixes)", s.diagnose, dataset="demo", query=wrong_namespace_query)
+    _call("run_query (wrong namespace -- suggest_fixes)", s.run_query, dataset="demo", query=wrong_namespace_query)
 
-    _call("query", s.query, dataset="demo", query=working_query)
+    ask_query = "PREFIX s223: <http://data.ashrae.org/standard223#> ASK { ?zone a s223:Zone }"
+    _call("run_query (ASK)", s.run_query, dataset="demo", query=ask_query)
 
 
 if __name__ == "__main__":

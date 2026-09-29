@@ -45,7 +45,7 @@ def _result_json(call_tool_result) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_query_on_b59_returns_curies_not_full_uris():
+async def test_run_query_on_b59_returns_curies_not_full_uris():
     async with create_connected_server_and_client_session(mcp) as client:
         loaded = _result_json(await client.call_tool("load_dataset", {"name": "b59", "path": str(B59)}))
         assert loaded["triple_count"] > 0
@@ -55,7 +55,7 @@ async def test_query_on_b59_returns_curies_not_full_uris():
 
         result = _result_json(
             await client.call_tool(
-                "query",
+                "run_query",
                 {
                     "dataset": "b59",
                     "query": "SELECT ?s ?p ?o WHERE { ?s ?p ?o . FILTER(isURI(?s) && isURI(?o)) }",
@@ -71,7 +71,7 @@ async def test_query_on_b59_returns_curies_not_full_uris():
 
 
 @pytest.mark.asyncio
-async def test_diagnose_on_b59_broken_query_abbreviates_culprit_and_connected_query():
+async def test_run_query_on_b59_broken_query_abbreviates_culprit_and_connected_query():
     async with create_connected_server_and_client_session(mcp) as client:
         await client.call_tool("load_dataset", {"name": "b59", "path": str(B59)})
 
@@ -79,7 +79,7 @@ async def test_diagnose_on_b59_broken_query_abbreviates_culprit_and_connected_qu
         # a reliable way to force a culprit without depending on b59's exact instance data.
         diagnosis = _result_json(
             await client.call_tool(
-                "diagnose",
+                "run_query",
                 {
                     "dataset": "b59",
                     "query": (
@@ -110,7 +110,7 @@ async def test_diagnose_on_b59_broken_query_abbreviates_culprit_and_connected_qu
 
 
 @pytest.mark.asyncio
-async def test_diagnose_suggests_a_verified_case_fix_on_b59():
+async def test_run_query_suggests_a_verified_case_fix_on_b59():
     # b59 defines s223:Zone; a query that mis-cases it as s223:zone is exactly the
     # kind of mistake suggest_fixes exists for -- verified end to end on real data,
     # not just the tiny synthetic graph test_server.py uses.
@@ -119,7 +119,7 @@ async def test_diagnose_suggests_a_verified_case_fix_on_b59():
 
         diagnosis = _result_json(
             await client.call_tool(
-                "diagnose",
+                "run_query",
                 {
                     "dataset": "b59",
                     "query": "PREFIX s223: <http://data.ashrae.org/standard223#> SELECT ?z WHERE { ?z a s223:zone . }",
@@ -135,7 +135,7 @@ async def test_diagnose_suggests_a_verified_case_fix_on_b59():
         assert fix["replacement_term"] == "s223:Zone"
         assert fix["row_count_with_fix"] > 0
 
-        rerun = _result_json(await client.call_tool("query", {"dataset": "b59", "query": fix["fixed_query"], "row_limit": None}))
+        rerun = _result_json(await client.call_tool("run_query", {"dataset": "b59", "query": fix["fixed_query"], "row_limit": None}))
         assert len(rerun["rows"]) == fix["row_count_with_fix"]
 
 

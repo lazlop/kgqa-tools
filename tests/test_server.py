@@ -52,10 +52,10 @@ def _result_json(call_tool_result) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_lists_all_five_tools():
+async def test_lists_all_four_tools():
     async with create_connected_server_and_client_session(mcp) as client:
         tools = (await client.list_tools()).tools
-        assert {t.name for t in tools} == {"load_dataset", "list_datasets", "summarize_schema", "diagnose", "query"}
+        assert {t.name for t in tools} == {"load_dataset", "list_datasets", "summarize_schema", "run_query"}
 
 
 @pytest.mark.asyncio
@@ -80,9 +80,9 @@ async def test_load_dataset_rejects_both_data_and_path():
 
 
 @pytest.mark.asyncio
-async def test_query_without_loading_dataset_first_is_a_clear_error():
+async def test_run_query_without_loading_dataset_first_is_a_clear_error():
     async with create_connected_server_and_client_session(mcp) as client:
-        result = await client.call_tool("query", {"dataset": "missing", "query": "SELECT * WHERE { ?s ?p ?o }"})
+        result = await client.call_tool("run_query", {"dataset": "missing", "query": "SELECT * WHERE { ?s ?p ?o }"})
         assert result.isError
         text = "".join(block.text for block in result.content if block.type == "text")
         assert "no dataset named 'missing'" in text
@@ -191,64 +191,63 @@ async def test_summarize_schema_without_loading_dataset_first_is_a_clear_error()
 
 
 @pytest.mark.asyncio
-async def test_diagnose_reports_ok_on_a_working_query_then_query_fetches_full_results():
+async def test_run_query_reports_ok_and_returns_rows_on_a_working_query():
     async with create_connected_server_and_client_session(mcp) as client:
         await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
 
-        diagnosis = _result_json(await client.call_tool("diagnose", {"dataset": "b223", "query": WORKING_QUERY}))
-        assert diagnosis["ok"] is True
-        assert diagnosis["row_count"] == 2
-        assert diagnosis["culprits"] == []
-        assert diagnosis["filter_issues"] == []
-        # sample_limit defaults to 3, so both of this query's rows come back for free.
-        assert diagnosis["sample_variables"] == ["s"]
+        result = _result_json(await client.call_tool("run_query", {"dataset": "b223", "query": WORKING_QUERY}))
+        assert result["ok"] is True
+        assert result["form"] == "solutions"
+        assert result["row_count"] == 2
+        assert result["culprits"] == []
+        assert result["filter_issues"] == []
+        assert result["diagnosis_error"] is None
+        # row_limit defaults to 3, so both of this query's rows come back.
+        assert result["variables"] == ["s"]
         # URIs come back as CURIEs (prefix:local), not full URIs, using the ex: prefix
         # declared in both the dataset and the query.
-        assert {row["s"]["value"] for row in diagnosis["sample_rows"]} == {"ex:sensor1", "ex:sensor2"}
-        assert diagnosis["prefixes"]["ex"] == "https://brickschema.org/schema/Brick#"
-
-        result = _result_json(await client.call_tool("query", {"dataset": "b223", "query": WORKING_QUERY}))
-        assert result["form"] == "solutions"
-        assert result["variables"] == ["s"]
-        values = {row["s"]["value"] for row in result["rows"]}
-        assert values == {"ex:sensor1", "ex:sensor2"}
+        assert {row["s"]["value"] for row in result["rows"]} == {"ex:sensor1", "ex:sensor2"}
         assert all(row["s"]["type"] == "uri" for row in result["rows"])
+        assert result["prefixes"]["ex"] == "https://brickschema.org/schema/Brick#"
 
 
 @pytest.mark.asyncio
-async def test_diagnose_sample_limit_caps_and_can_be_disabled():
+async def test_run_query_row_limit_caps_and_can_be_disabled():
     async with create_connected_server_and_client_session(mcp) as client:
         await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
 
-        capped = _result_json(await client.call_tool("diagnose", {"dataset": "b223", "query": WORKING_QUERY, "sample_limit": 1}))
-        assert len(capped["sample_rows"]) == 1
+        capped = _result_json(await client.call_tool("run_query", {"dataset": "b223", "query": WORKING_QUERY, "row_limit": 1}))
+        assert len(capped["rows"]) == 1
+        assert capped["row_count"] == 2  # row_limit never affects the full count
 
-        disabled = _result_json(await client.call_tool("diagnose", {"dataset": "b223", "query": WORKING_QUERY, "sample_limit": 0}))
-        assert disabled["sample_variables"] == []
-        assert disabled["sample_rows"] == []
+        disabled = _result_json(await client.call_tool("run_query", {"dataset": "b223", "query": WORKING_QUERY, "row_limit": 0}))
+        assert disabled["variables"] == []
+        assert disabled["rows"] == []
 
 
 @pytest.mark.asyncio
-async def test_diagnose_with_connect_true_has_no_sample_rows():
-    # diagnose_and_connect doesn't support sample_limit, regardless of what's passed.
+async def test_run_query_with_connect_true_still_returns_rows():
+    # diagnose_and_connect doesn't sample rows itself, so run_query executes the query
+    # separately to fill them in -- connect=True must not cost the caller the results.
     async with create_connected_server_and_client_session(mcp) as client:
         await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
-        diagnosis = _result_json(
-            await client.call_tool("diagnose", {"dataset": "b223", "query": WORKING_QUERY, "connect": True, "sample_limit": 3})
+        result = _result_json(
+            await client.call_tool("run_query", {"dataset": "b223", "query": WORKING_QUERY, "connect": True, "row_limit": 3})
         )
-        assert diagnosis["sample_variables"] == []
-        assert diagnosis["sample_rows"] == []
+        assert result["ok"] is True
+        assert result["variables"] == ["s"]
+        assert {row["s"]["value"] for row in result["rows"]} == {"ex:sensor1", "ex:sensor2"}
 
 
 @pytest.mark.asyncio
-async def test_diagnose_reports_a_culprit_but_no_fix_by_default():
+async def test_run_query_reports_a_culprit_but_no_fix_by_default():
     # `connect` defaults to False: diagnosis is nearly free and always run, but the
     # (comparatively expensive, experimental) connection search only runs when asked
-    # for explicitly -- see the `connect` docs on the `diagnose` tool.
+    # for explicitly -- see the `connect` docs on the `run_query` tool.
     async with create_connected_server_and_client_session(mcp) as client:
         await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
 
-        diagnosis = _result_json(await client.call_tool("diagnose", {"dataset": "b223", "query": BROKEN_QUERY}))
+        diagnosis = _result_json(await client.call_tool("run_query", {"dataset": "b223", "query": BROKEN_QUERY}))
         assert diagnosis["ok"] is False
         assert diagnosis["row_count"] == 0
         assert len(diagnosis["culprits"]) == 1
@@ -263,11 +262,11 @@ async def test_diagnose_reports_a_culprit_but_no_fix_by_default():
 
 
 @pytest.mark.asyncio
-async def test_diagnose_with_connect_true_suggests_a_fix():
+async def test_run_query_with_connect_true_suggests_a_fix():
     async with create_connected_server_and_client_session(mcp) as client:
         await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
 
-        diagnosis = _result_json(await client.call_tool("diagnose", {"dataset": "b223", "query": BROKEN_QUERY, "connect": True}))
+        diagnosis = _result_json(await client.call_tool("run_query", {"dataset": "b223", "query": BROKEN_QUERY, "connect": True}))
         assert diagnosis["ok"] is False
         assert diagnosis["row_count"] == 0
         assert len(diagnosis["culprits"]) == 1
@@ -282,8 +281,8 @@ async def test_diagnose_with_connect_true_suggests_a_fix():
         # carries its own PREFIX lines rather than relying on the caller to supply them.
         assert "PREFIX" in culprit["connected_query"]
 
-        # The suggested connected_query should itself actually work via `query`.
-        fixed = _result_json(await client.call_tool("query", {"dataset": "b223", "query": culprit["connected_query"]}))
+        # The suggested connected_query should itself actually work via `run_query`.
+        fixed = _result_json(await client.call_tool("run_query", {"dataset": "b223", "query": culprit["connected_query"]}))
         assert fixed["form"] == "solutions"
         assert len(fixed["rows"]) == culprit["row_count_with_fix"]
 
@@ -308,11 +307,11 @@ SELECT ?z WHERE { ?z a s223:zone . }
 
 
 @pytest.mark.asyncio
-async def test_diagnose_suggests_a_verified_wrong_namespace_fix():
+async def test_run_query_suggests_a_verified_wrong_namespace_fix():
     async with create_connected_server_and_client_session(mcp) as client:
         await client.call_tool("load_dataset", {"name": "ns", "data": NAMESPACE_TTL})
 
-        diagnosis = _result_json(await client.call_tool("diagnose", {"dataset": "ns", "query": WRONG_NAMESPACE_QUERY}))
+        diagnosis = _result_json(await client.call_tool("run_query", {"dataset": "ns", "query": WRONG_NAMESPACE_QUERY}))
         assert diagnosis["ok"] is False
         culprit = diagnosis["culprits"][0]
         assert len(culprit["suggested_fixes"]) == 1
@@ -326,16 +325,16 @@ async def test_diagnose_suggests_a_verified_wrong_namespace_fix():
 
         # The fix is verified, not just guessed: rerunning fixed_query for real
         # returns exactly what it claims.
-        rerun = _result_json(await client.call_tool("query", {"dataset": "ns", "query": fix["fixed_query"], "row_limit": None}))
+        rerun = _result_json(await client.call_tool("run_query", {"dataset": "ns", "query": fix["fixed_query"], "row_limit": None}))
         assert len(rerun["rows"]) == fix["row_count_with_fix"]
 
 
 @pytest.mark.asyncio
-async def test_diagnose_falls_back_to_a_case_typo_fix_when_no_namespace_match_exists():
+async def test_run_query_falls_back_to_a_case_typo_fix_when_no_namespace_match_exists():
     async with create_connected_server_and_client_session(mcp) as client:
         await client.call_tool("load_dataset", {"name": "ns", "data": NAMESPACE_TTL})
 
-        diagnosis = _result_json(await client.call_tool("diagnose", {"dataset": "ns", "query": WRONG_CASE_QUERY}))
+        diagnosis = _result_json(await client.call_tool("run_query", {"dataset": "ns", "query": WRONG_CASE_QUERY}))
         assert diagnosis["ok"] is False
         culprit = diagnosis["culprits"][0]
         assert len(culprit["suggested_fixes"]) == 1
@@ -348,12 +347,12 @@ async def test_diagnose_falls_back_to_a_case_typo_fix_when_no_namespace_match_ex
 
 
 @pytest.mark.asyncio
-async def test_diagnose_suggest_fixes_false_disables_the_search():
+async def test_run_query_suggest_fixes_false_disables_the_search():
     async with create_connected_server_and_client_session(mcp) as client:
         await client.call_tool("load_dataset", {"name": "ns", "data": NAMESPACE_TTL})
 
         diagnosis = _result_json(
-            await client.call_tool("diagnose", {"dataset": "ns", "query": WRONG_NAMESPACE_QUERY, "suggest_fixes": False})
+            await client.call_tool("run_query", {"dataset": "ns", "query": WRONG_NAMESPACE_QUERY, "suggest_fixes": False})
         )
         assert diagnosis["culprits"][0]["suggested_fixes"] == []
 
@@ -378,59 +377,62 @@ SELECT ?sensor ?value WHERE {
 
 
 @pytest.mark.asyncio
-async def test_diagnose_skips_the_expensive_search_once_a_query_already_returns_rows():
+async def test_run_query_skips_the_expensive_search_once_a_query_already_returns_rows():
     # ignore_cartesian_risk/expand_nonempty_results aren't exposed as MCP parameters (see
-    # test_diagnose_tool_schema_has_no_cartesian_or_expand_params) -- an MCP caller always gets
+    # test_run_query_tool_schema_has_no_cartesian_or_expand_params) -- an MCP caller always gets
     # the search skipped once the query already returns at least one row.
     async with create_connected_server_and_client_session(mcp) as client:
         await client.call_tool("load_dataset", {"name": "vals", "data": VALUE_TTL})
 
-        result = _result_json(await client.call_tool("diagnose", {"dataset": "vals", "query": NARROWED_QUERY}))
+        result = _result_json(await client.call_tool("run_query", {"dataset": "vals", "query": NARROWED_QUERY}))
         assert result["row_count"] == 1
         assert result["ok"] is True
         assert result["filter_issues"] == []
 
 
 @pytest.mark.asyncio
-async def test_diagnose_tool_schema_has_no_cartesian_or_expand_params():
+async def test_run_query_tool_schema_has_no_cartesian_or_expand_params():
     # README/docstring both say these aren't caller-settable over MCP -- the tool's advertised
     # schema shouldn't offer them either.
     async with create_connected_server_and_client_session(mcp) as client:
         tools = {t.name: t for t in (await client.list_tools()).tools}
-        properties = tools["diagnose"].inputSchema["properties"]
+        properties = tools["run_query"].inputSchema["properties"]
         assert "ignore_cartesian_risk" not in properties
         assert "expand_nonempty_results" not in properties
 
 
 @pytest.mark.asyncio
-async def test_query_row_limit_caps_solutions():
+async def test_run_query_row_limit_caps_solutions():
     async with create_connected_server_and_client_session(mcp) as client:
         await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
-        result = _result_json(await client.call_tool("query", {"dataset": "b223", "query": WORKING_QUERY, "row_limit": 1}))
+        result = _result_json(await client.call_tool("run_query", {"dataset": "b223", "query": WORKING_QUERY, "row_limit": 1}))
         assert len(result["rows"]) == 1
 
 
 @pytest.mark.asyncio
-async def test_query_default_row_limit_is_three():
+async def test_run_query_default_row_limit_is_three():
     ttl = TTL + "\n".join(f"ex:sensor{i} a ex:TempSensor ." for i in range(3, 8))
     query_all_sensors = "PREFIX ex: <https://brickschema.org/schema/Brick#> SELECT ?s WHERE { ?s a ex:TempSensor }"
     async with create_connected_server_and_client_session(mcp) as client:
         await client.call_tool("load_dataset", {"name": "b223", "data": ttl})
-        result = _result_json(await client.call_tool("query", {"dataset": "b223", "query": query_all_sensors}))
+        result = _result_json(await client.call_tool("run_query", {"dataset": "b223", "query": query_all_sensors}))
         assert len(result["rows"]) == 3
 
 
 @pytest.mark.asyncio
-async def test_query_ask_and_construct_forms():
+async def test_run_query_ask_and_construct_forms():
     async with create_connected_server_and_client_session(mcp) as client:
         await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
 
-        ask = _result_json(await client.call_tool("query", {"dataset": "b223", "query": "PREFIX ex: <https://brickschema.org/schema/Brick#> ASK { ex:sensor1 a ex:TempSensor }"}))
-        assert ask == {"form": "boolean", "result": True}
+        ask = _result_json(await client.call_tool("run_query", {"dataset": "b223", "query": "PREFIX ex: <https://brickschema.org/schema/Brick#> ASK { ex:sensor1 a ex:TempSensor }"}))
+        assert ask["form"] == "boolean"
+        assert ask["result"] is True
+        assert ask["ok"] is True
+        assert ask["row_count"] == 1
 
         construct = _result_json(
             await client.call_tool(
-                "query",
+                "run_query",
                 {
                     "dataset": "b223",
                     "query": "PREFIX ex: <https://brickschema.org/schema/Brick#> CONSTRUCT { ?s a ex:Thing } WHERE { ?s a ex:TempSensor }",
@@ -438,19 +440,79 @@ async def test_query_ask_and_construct_forms():
             )
         )
         assert construct["form"] == "graph"
+        assert construct["ok"] is True
+        assert construct["row_count"] == 2
         assert len(construct["triples"]) == 2
 
 
 @pytest.mark.asyncio
-async def test_diagnose_rejects_non_select_queries():
+async def test_run_query_diagnoses_a_false_ask_and_an_empty_construct():
+    # Same broken pattern as BROKEN_QUERY, wrapped in ASK/CONSTRUCT/DESCRIBE: the WHERE body
+    # is diagnosed as a SELECT, so the culprit is reported just like it is for the SELECT.
+    body = "{ ex:building223 ex:hasSensor ?sensor . ?sensor a ex:TempSensor . }"
+    prefix = "PREFIX ex: <https://brickschema.org/schema/Brick#>\n"
     async with create_connected_server_and_client_session(mcp) as client:
         await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
-        result = await client.call_tool("diagnose", {"dataset": "b223", "query": "ASK { ?s ?p ?o }"})
+
+        for query in (
+            f"{prefix}ASK {body}",
+            # template contains a string with a brace in it, to exercise the rewrite's masking
+            f'{prefix}CONSTRUCT {{ ?sensor ex:label "}}" }} WHERE {body}',
+            f"{prefix}CONSTRUCT WHERE {body}",
+            f"{prefix}DESCRIBE ?sensor WHERE {body}",
+        ):
+            result = _result_json(await client.call_tool("run_query", {"dataset": "b223", "query": query}))
+            assert result["ok"] is False, query
+            assert result["row_count"] == 0, query
+            assert result["diagnosis_error"] is None, query
+            assert result["culprits"][0]["triples"][0]["triple"] == "ex:building223 ex:hasSensor ?sensor", query
+            if result["form"] == "boolean":
+                assert result["result"] is False
+            else:
+                assert result["triples"] == [], query
+
+
+@pytest.mark.asyncio
+async def test_run_query_executes_a_bare_describe_without_diagnosing():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
+        result = _result_json(
+            await client.call_tool(
+                "run_query",
+                {"dataset": "b223", "query": "PREFIX ex: <https://brickschema.org/schema/Brick#> DESCRIBE ex:sensor1", "row_limit": None},
+            )
+        )
+        assert result["form"] == "graph"
+        assert result["ok"] is True
+        assert result["row_count"] is None
+        assert {t["object"]["value"] for t in result["triples"]} == {"ex:TempSensor"}
+
+
+@pytest.mark.asyncio
+async def test_run_query_still_executes_a_query_it_cannot_diagnose():
+    # An all-variable pattern has no BGP triples for the ablation search to work with --
+    # the diagnosis errors, but the caller still gets the query's results.
+    async with create_connected_server_and_client_session(mcp) as client:
+        await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
+        result = _result_json(
+            await client.call_tool("run_query", {"dataset": "b223", "query": "SELECT * WHERE { ?s ?p ?o }", "row_limit": None})
+        )
+        assert result["diagnosis_error"] is not None
+        assert result["ok"] is False
+        assert result["row_count"] is None
+        assert len(result["rows"]) == 4
+
+
+@pytest.mark.asyncio
+async def test_run_query_surfaces_a_syntax_error():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
+        result = await client.call_tool("run_query", {"dataset": "b223", "query": "SELEC ?s WHERE { ?s ?p ?o"})
         assert result.isError
 
 
 @pytest.mark.asyncio
-async def test_replacing_a_dataset_is_reflected_in_diagnose_not_served_stale():
+async def test_replacing_a_dataset_is_reflected_in_run_query_not_served_stale():
     # diagnose routes through a persistent forked worker (see DiagnoseWorker in
     # server.py) that's only supposed to be replaced -- picking up the new data --
     # when load_dataset changes something. This is the test for that wiring: if
@@ -463,9 +525,9 @@ async def test_replacing_a_dataset_is_reflected_in_diagnose_not_served_stale():
     """
     async with create_connected_server_and_client_session(mcp) as client:
         await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
-        first = _result_json(await client.call_tool("diagnose", {"dataset": "b223", "query": WORKING_QUERY}))
+        first = _result_json(await client.call_tool("run_query", {"dataset": "b223", "query": WORKING_QUERY}))
         assert first["row_count"] == 2  # forces the worker to actually fork with the original data loaded
 
         await client.call_tool("load_dataset", {"name": "b223", "data": replacement_ttl})
-        second = _result_json(await client.call_tool("diagnose", {"dataset": "b223", "query": WORKING_QUERY}))
+        second = _result_json(await client.call_tool("run_query", {"dataset": "b223", "query": WORKING_QUERY}))
         assert second["row_count"] == 1
