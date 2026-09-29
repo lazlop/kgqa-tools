@@ -77,6 +77,15 @@ exactly what's wrong when it doesn't, and raising `row_limit` is all it takes to
 results. Leave `connect` off by default; it's there for cases where an automatic suggested fix is
 worth the extra cost, not as the first thing to reach for.
 
+## Ontologies
+
+Data graphs usually reference ontology terms without including their definitions, so load the
+ontology into the same dataset (`load_dataset` with `path` after downloading, or pass its text as
+`data`) when you need class hierarchies, definitions or searchable labels:
+
+- **ASHRAE 223P** (`s223:`): <https://open223.info/223p.ttl>
+- **Brick** (`brick:`): <https://brickschema.org/schema/1.4.4/Brick.ttl>
+
 ## What the output looks like
 
 Every URI a tool returns is abbreviated to `prefix:local` (e.g. `s223:Zone`) instead of a full

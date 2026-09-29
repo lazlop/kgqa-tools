@@ -68,7 +68,9 @@ _CORE_INSTRUCTIONS = (
     "return rows) in that culprit's suggested_fixes when one exists; this is unrelated to and "
     "much cheaper than connect. Every URI any tool returns is abbreviated to prefix:local "
     "(e.g. s223:Zone) using the dataset's declared prefixes plus common defaults -- each "
-    "response's own `prefixes` field lists exactly which bindings were used."
+    "response's own `prefixes` field lists exactly which bindings were used. Ontology "
+    "files: ASHRAE 223P at https://open223.info/223p.ttl, Brick at "
+    "https://brickschema.org/schema/1.4.4/Brick.ttl."
 )
 
 _EXTENDED_INSTRUCTIONS = _CORE_INSTRUCTIONS + (
