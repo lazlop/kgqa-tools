@@ -23,6 +23,12 @@ reruns, reporting the result in that culprit's `suggested_fixes` only once verif
 actually return rows. See `_suggest_fixes_for_culprit`. This is unrelated to and much
 cheaper than `connect`, and runs regardless of it.
 
+The default `extended` toolset (see TOOLSETS) adds two exploration tools on top of
+those five: `search` (BM25 or regex over node names and string literals, for finding a
+URI before querying it) and `traverse` (a breadth-first walk from a node along chosen
+predicates, returned as a per-level DAG). `--toolset core` exposes only the original
+five, for when the extra tool descriptions aren't worth their context cost.
+
 Every URI any tool returns is abbreviated to `prefix:local` (e.g. `s223:Zone`) rather
 than a full URI, using the dataset's own declared prefixes plus common defaults --
 see `DEFAULT_PREFIXES`/`_dataset_prefixes` -- so results read the way an agent
@@ -31,11 +37,15 @@ actually writes SPARQL and don't burn context on repeated namespace strings.
 
 from __future__ import annotations
 
+import argparse
+import math
 import multiprocessing as mp
+import os
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Optional
 
 from bschema_rs import create_bschema
 from mcp.server.fastmcp import FastMCP
@@ -43,30 +53,37 @@ from rdflib import Graph
 from rdflib.namespace import RDFS
 from sparql_relax import QueryResult, Store, Term
 
-mcp = FastMCP(
-    name="sparql-relax",
-    instructions=(
-        "Tools for understanding and debugging SPARQL/RDF graphs. Load a graph with "
-        "load_dataset, then call summarize_schema ONCE to see the graph's repeated structural "
-        "patterns before writing any SPARQL against it -- it's cached, so calling it again is "
-        "free but adds nothing new. From there, diagnose is the tool for almost every query -- "
-        "ALWAYS call it before trusting a query's result. It's cheap even when the query already "
-        "works, explains exactly which triple or FILTER is broken when it doesn't, and by "
-        "default also samples a few rows of the query's own result for free -- for most purposes "
-        "that sample is enough, and you don't need query at all. Only reach for query as a "
-        "fallback: when you need more rows than the sample, or are after something specific (a "
-        "particular room or VAV, say) that isn't in the sample and isn't easily pinned down by "
-        "adding a FILTER/VALUES clause to the query yourself. diagnose's connect=True option "
-        "additionally tries to search the graph for a corrected query, but that search is "
-        "experimental and its suggestions should be verified, not trusted outright -- leave "
-        "connect off unless you specifically want to try it. Separately, and by default, diagnose "
-        "also checks each broken triple for the single most common mistake -- right local name, "
-        "wrong namespace, or a mis-cased local name -- and reports a verified fix (query rerun and "
-        "confirmed to return rows) in that culprit's suggested_fixes when one exists; this is "
-        "unrelated to and much cheaper than connect. Every URI any tool returns is abbreviated to "
-        "prefix:local (e.g. s223:Zone) using the dataset's declared prefixes plus common defaults "
-        "-- each response's own `prefixes` field lists exactly which bindings were used."
-    ),
+_CORE_INSTRUCTIONS = (
+    "Tools for understanding and debugging SPARQL/RDF graphs. Load a graph with "
+    "load_dataset, then call summarize_schema ONCE to see the graph's repeated structural "
+    "patterns before writing any SPARQL against it -- it's cached, so calling it again is "
+    "free but adds nothing new. From there, diagnose is the tool for almost every query -- "
+    "ALWAYS call it before trusting a query's result. It's cheap even when the query already "
+    "works, explains exactly which triple or FILTER is broken when it doesn't, and by "
+    "default also samples a few rows of the query's own result for free -- for most purposes "
+    "that sample is enough, and you don't need query at all. Only reach for query as a "
+    "fallback: when you need more rows than the sample, or are after something specific (a "
+    "particular room or VAV, say) that isn't in the sample and isn't easily pinned down by "
+    "adding a FILTER/VALUES clause to the query yourself. diagnose's connect=True option "
+    "additionally tries to search the graph for a corrected query, but that search is "
+    "experimental and its suggestions should be verified, not trusted outright -- leave "
+    "connect off unless you specifically want to try it. Separately, and by default, diagnose "
+    "also checks each broken triple for the single most common mistake -- right local name, "
+    "wrong namespace, or a mis-cased local name -- and reports a verified fix (query rerun and "
+    "confirmed to return rows) in that culprit's suggested_fixes when one exists; this is "
+    "unrelated to and much cheaper than connect. Every URI any tool returns is abbreviated to "
+    "prefix:local (e.g. s223:Zone) using the dataset's declared prefixes plus common defaults "
+    "-- each response's own `prefixes` field lists exactly which bindings were used."
+)
+
+_EXTENDED_INSTRUCTIONS = _CORE_INSTRUCTIONS + (
+    " When you don't yet know the URI for a concept (a class, a predicate, or a specific "
+    "instance), use search to find it -- by keyword (mode='bm25', over local names, labels, "
+    "comments and other string literals) or by regex -- instead of guessing names and letting "
+    "diagnose catch the guess. To walk a hierarchy or a chain of relations (up or down an "
+    "rdfs:subClassOf taxonomy, downstream along brick:feeds, ...), use traverse with a direction "
+    "and a predicate list; it returns the reachable structure level by level, with every edge "
+    "into each node, which a SPARQL property path's flat result doesn't show."
 )
 
 
@@ -93,6 +110,11 @@ _schema_summaries: dict[str, dict[str, Any]] = {}
 class graph is real work (iterative graph relabeling), and the point of the tool is
 to be called once per dataset, so a repeat call should be free rather than
 recomputing. Cleared for a name whenever `load_dataset` replaces it."""
+
+_search_indexes: dict[str, "_SearchIndex"] = {}
+"""Cache of `search`'s per-dataset index, keyed by dataset name -- built lazily on
+the first `search` call against a dataset (one full scan of its triples), then
+reused. Cleared for a name whenever `load_dataset` replaces it."""
 
 _RDFLIB_FORMATS = {
     "turtle": "turtle",
@@ -757,7 +779,6 @@ def _term_to_json(term: Optional[Term], prefixes: dict[str, str], used: set[str]
     return out
 
 
-@mcp.tool()
 def load_dataset(name: str, data: Optional[str] = None, path: Optional[str] = None, format: str = "turtle") -> dict[str, Any]:
     """Load RDF data into memory as a named dataset for `diagnose`/`query` to run against.
 
@@ -786,16 +807,15 @@ def load_dataset(name: str, data: Optional[str] = None, path: Optional[str] = No
     _datasets[name] = _Dataset(store=store, data=data, format=format, triple_count=triple_count, prefixes=prefixes)
     _invalidate_diagnose_worker()
     _schema_summaries.pop(name, None)
+    _search_indexes.pop(name, None)
     return {"name": name, "format": format, "triple_count": triple_count, "declared_prefixes": declared_prefixes}
 
 
-@mcp.tool()
 def list_datasets() -> list[dict[str, Any]]:
     """List every dataset currently loaded via `load_dataset`, with its format and triple count."""
     return [{"name": name, "format": ds.format, "triple_count": ds.triple_count} for name, ds in sorted(_datasets.items())]
 
 
-@mcp.tool()
 def summarize_schema(
     dataset: str,
     iterations: int = 10,
@@ -910,7 +930,6 @@ def summarize_schema(
     return result
 
 
-@mcp.tool()
 def diagnose(
     dataset: str,
     query: str,
@@ -1136,7 +1155,6 @@ def diagnose(
     }
 
 
-@mcp.tool()
 def query(dataset: str, query: str, row_limit: Optional[int] = 3) -> dict[str, Any]:
     """Run any SPARQL query (SELECT/ASK/CONSTRUCT/DESCRIBE) against `dataset` and return its
     actual results.
@@ -1193,9 +1211,525 @@ def query(dataset: str, query: str, row_limit: Optional[int] = 3) -> dict[str, A
     }
 
 
-def main() -> None:
+# ==============================================================================
+#  TERM RESOLUTION (shared by traverse/search)
+# ==============================================================================
+
+RDFS_SUBCLASS_OF_URI = "http://www.w3.org/2000/01/rdf-schema#subClassOf"
+XSD_STRING_URI = "http://www.w3.org/2001/XMLSchema#string"
+RDF_LANGSTRING_URI = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString"
+
+_CURIE_RE = re.compile(r"^([A-Za-z_][\w.-]*)?:(.*)$")
+_IRI_FORBIDDEN_RE = re.compile(r'[\s<>"{}|\\^`]')
+
+
+def _resolve_term(text: str, prefixes: dict[str, str]) -> str:
+    """Turns a term an agent wrote -- `prefix:local` (using the dataset's own
+    prefixes plus defaults, same as every tool's output), `<full uri>`, a bare full
+    URI, or `a` for `rdf:type` -- into the full URI to put in a query. Raises on an
+    unknown prefix rather than treating it as a URI scheme, since a mistyped prefix
+    (`brik:`) would otherwise silently match nothing."""
+    text = text.strip()
+    if text == "a":
+        return RDF_TYPE_URI
+    if text.startswith("<") and text.endswith(">"):
+        uri = text[1:-1]
+    else:
+        match = _CURIE_RE.match(text)
+        prefix = (match.group(1) or "") if match else None
+        if match and prefix in prefixes:
+            uri = prefixes[prefix] + match.group(2)
+        elif "://" in text or text.startswith("urn:"):
+            uri = text
+        else:
+            raise ValueError(
+                f"can't resolve {text!r} to a URI: use prefix:local with a prefix the dataset declares "
+                "(or a common default like brick:, s223:, rdfs:), or a full URI"
+            )
+    if not uri or _IRI_FORBIDDEN_RE.search(uri):
+        raise ValueError(f"{text!r} isn't a valid URI")
+    return uri
+
+
+def _literal_display(term: Term, prefixes: dict[str, str], used: set[str]) -> str:
+    """Renders a literal compactly in Turtle-like form: `"text"`, `"text"@en`, or
+    `"72.5"^^xsd:double` -- plain strings get no datatype, matching how they're
+    usually written."""
+    text = '"' + term.value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    if term.language:
+        return f"{text}@{term.language}"
+    if term.datatype and term.datatype not in (XSD_STRING_URI, RDF_LANGSTRING_URI):
+        curie, prefix = _uri_to_curie(term.datatype, prefixes)
+        if prefix is not None:
+            used.add(prefix)
+            return f"{text}^^{curie}"
+        return f"{text}^^<{curie}>"
+    return text
+
+
+# ==============================================================================
+#  TRAVERSE
+# ==============================================================================
+#
+# SPARQL property paths (`?x rdfs:subClassOf* ?y`, `?a brick:feeds+ ?b`) answer
+# "what's reachable", but flatten it into pairs: no depth, no record of which edge
+# reached which node, and no sense of the shape. For a taxonomy with multiple
+# inheritance (Brick has plenty), or an HVAC `feeds` graph with loops, that shape is
+# exactly what an agent exploring the graph wants. `traverse` does a breadth-first
+# walk and returns the reachable subgraph as a DAG grouped by depth: each node
+# appears once, at the depth it was first reached, with *every* edge from an
+# expanded node into it listed in `via` -- so multiple parents show up as multiple
+# `via` entries rather than as duplicated paths (whose count can grow
+# combinatorially), and cycles terminate naturally since a visited node is never
+# expanded twice. Each depth is one SPARQL query with the whole frontier in a
+# `VALUES` block, not one query per node.
+
+TRAVERSE_EDGE_LIMIT_FACTOR = 10
+"""Per-level cap on edges fetched, as a multiple of `max_nodes` -- enough headroom
+that edges into already-seen nodes (multiple parents, cycles) don't crowd out new
+ones in the common case, while still bounding a hub node (say, `brick:Point`
+walked `incoming` over `rdf:type`, with thousands of instances)."""
+
+
+def _traverse_step_query(frontier: list[str], direction: str, predicate_uris: Optional[list[str]], limit: Optional[int]) -> str:
+    values = " ".join(f"<{u}>" for u in frontier)
+    pred_values = f"VALUES ?p {{ {' '.join(f'<{u}>' for u in predicate_uris)} }} " if predicate_uris else ""
+    pattern = "?src ?p ?dst" if direction == "outgoing" else "?dst ?p ?src"
+    limit_clause = f" LIMIT {limit}" if limit is not None else ""
+    return f"SELECT ?src ?p ?dst WHERE {{ VALUES ?src {{ {values} }} {pred_values}{pattern} . }} ORDER BY ?src ?p ?dst{limit_clause}"
+
+
+def traverse(
+    dataset: str,
+    start: str,
+    direction: Literal["outgoing", "incoming"] = "outgoing",
+    predicates: Optional[list[str]] = None,
+    max_depth: int = 3,
+    max_nodes: int = 100,
+) -> dict[str, Any]:
+    """Walk the graph breadth-first from `start` and return what's reachable, level by level.
+
+    `direction="outgoing"` follows `start pred ?next` edges; `"incoming"` follows `?next pred
+    start`. `predicates` (e.g. `["rdfs:subClassOf"]`, `["brick:feeds"]`) restricts which edges are
+    followed; omit it to follow every predicate. For a taxonomy: outgoing `rdfs:subClassOf` walks
+    up to superclasses, incoming walks down to subclasses.
+
+    Each node appears once, at the depth first reached, with `via` listing every
+    `[previous_node, predicate]` edge that reaches it -- several entries mean several parents.
+    Literals are leaves; blank nodes are skipped. `truncated` means `max_nodes` or the per-level
+    edge cap was hit; `more_beyond_max_depth` means the last level has further edges.
+    """
+    store = _require_dataset(dataset)
+    prefixes = _datasets[dataset].prefixes
+    used_prefixes: set[str] = set()
+    if direction not in ("outgoing", "incoming"):
+        raise ValueError("direction must be 'outgoing' or 'incoming'")
+    if max_depth < 1 or max_nodes < 1:
+        raise ValueError("max_depth and max_nodes must both be at least 1")
+    start_uri = _resolve_term(start, prefixes)
+    predicate_uris = [_resolve_term(p, prefixes) for p in predicates] if predicates else None
+
+    def _display(term: Term) -> str:
+        if term.kind == "literal":
+            return _literal_display(term, prefixes, used_prefixes)
+        curie, prefix = _uri_to_curie(term.value, prefixes)
+        if prefix is not None:
+            used_prefixes.add(prefix)
+        return curie
+
+    start_display, start_prefix = _uri_to_curie(start_uri, prefixes)
+    if start_prefix is not None:
+        used_prefixes.add(start_prefix)
+
+    # Keyed by display form: CURIEs/URIs and literals (which always start with `"`)
+    # can't collide, and two distinct URIs never abbreviate to the same CURIE.
+    depth_of: dict[str, int] = {start_display: 0}
+    via: dict[str, list[list[str]]] = {start_display: []}
+    order: list[str] = [start_display]
+    frontier = [start_uri]
+    truncated = False
+    blank_node_edges_skipped = 0
+    edge_limit = max_nodes * TRAVERSE_EDGE_LIMIT_FACTOR
+
+    for depth in range(1, max_depth + 1):
+        if not frontier:
+            break
+        result = store.query(_traverse_step_query(frontier, direction, predicate_uris, edge_limit + 1))
+        rows = result.rows
+        if len(rows) > edge_limit:
+            truncated = True
+            rows = rows[:edge_limit]
+        next_frontier: list[str] = []
+        for src, pred, dst in rows:
+            if dst.kind == "bnode":
+                blank_node_edges_skipped += 1
+                continue
+            key = _display(dst)
+            if key not in depth_of:
+                if len(order) >= max_nodes:
+                    truncated = True
+                    continue
+                depth_of[key] = depth
+                via[key] = []
+                order.append(key)
+                if dst.kind == "uri":
+                    next_frontier.append(dst.value)
+            via[key].append([_display(src), _display(pred)])
+        frontier = next_frontier
+
+    more_beyond_max_depth = False
+    if frontier:
+        probe = store.query(_traverse_step_query(frontier, direction, predicate_uris, 1))
+        more_beyond_max_depth = bool(probe.rows)
+
+    levels: list[dict[str, Any]] = []
+    for key in order:
+        depth = depth_of[key]
+        if depth == len(levels):
+            levels.append({"depth": depth, "nodes": []})
+        levels[depth]["nodes"].append({"node": key, "via": via[key]})
+
+    node_count = len(order) - 1
+    pred_note = f" via {', '.join(predicates)}" if predicates else ""
+    if node_count == 0:
+        other = "incoming" if direction == "outgoing" else "outgoing"
+        message = (
+            f"No {direction} edges{pred_note} from {start_display}. Check the start term (search can find it), "
+            f"or try direction='{other}'."
+        )
+    else:
+        message = f"Reached {node_count} node(s){pred_note} across {len(levels) - 1} level(s)."
+        if truncated:
+            message += " Truncated -- narrow `predicates` or raise `max_nodes` to see more."
+        if more_beyond_max_depth:
+            message += " More levels exist beyond max_depth -- raise it, or traverse again from a last-level node."
+
+    return {
+        "start": start_display,
+        "direction": direction,
+        "predicates": [_display_curie(u, prefixes, used_prefixes) for u in predicate_uris] if predicate_uris else None,
+        "levels": levels,
+        "node_count": node_count,
+        "truncated": truncated,
+        "more_beyond_max_depth": more_beyond_max_depth,
+        "blank_node_edges_skipped": blank_node_edges_skipped,
+        "prefixes": {p: prefixes[p] for p in sorted(used_prefixes)},
+        "message": message,
+    }
+
+
+def _display_curie(uri: str, prefixes: dict[str, str], used: set[str]) -> str:
+    curie, prefix = _uri_to_curie(uri, prefixes)
+    if prefix is not None:
+        used.add(prefix)
+    return curie
+
+
+# ==============================================================================
+#  SEARCH
+# ==============================================================================
+#
+# Nothing else here answers "what's the URI for X?" -- `summarize_schema` shows the
+# graph's shape and `diagnose`/`query` need terms the agent already knows. `search`
+# indexes every named (non-blank) node once per dataset as a small text document:
+# its local name split into words (`Supply_Air_Temperature_Sensor`, `hasPoint`,
+# `AHU01` -> supply air temperature sensor / has point / ahu 01 -- without this
+# split BM25 matches almost nothing in building graphs, whose names are mostly
+# compound identifiers), the local names of its `rdf:type`s, and every short string
+# literal attached to it (labels, comments, definitions, BACnet object names, ...).
+# The local name counts double, since it's the most reliable signal of what a node
+# is. BM25 is implemented inline -- it's a few lines of arithmetic, not worth a
+# dependency.
+#
+# Each node also gets a `kinds` set: `class` (used as an `rdf:type` object, on
+# either side of `rdfs:subClassOf`, or typed owl:Class/rdfs:Class), `predicate`
+# (used in predicate position, or typed as a property), else `instance`.
+
+BM25_K1 = 1.5
+BM25_B = 0.75
+SEARCH_MAX_LITERAL_CHARS = 1000
+"""String literals longer than this aren't indexed -- long blobs (embedded
+documents, serialized JSON) would dominate a node's document length and add noise,
+not findability."""
+
+_CLASS_TYPE_URIS = {
+    "http://www.w3.org/2002/07/owl#Class",
+    "http://www.w3.org/2000/01/rdf-schema#Class",
+}
+_PROPERTY_TYPE_URIS = {
+    "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property",
+    "http://www.w3.org/2002/07/owl#ObjectProperty",
+    "http://www.w3.org/2002/07/owl#DatatypeProperty",
+    "http://www.w3.org/2002/07/owl#AnnotationProperty",
+}
+_LABEL_PREDICATE_URIS = (
+    "http://www.w3.org/2000/01/rdf-schema#label",
+    "http://www.w3.org/2004/02/skos/core#prefLabel",
+)
+
+_WORD_CHUNK_RE = re.compile(r"[^\W_]+")
+_CAMEL_TOKEN_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+")
+
+
+def _tokenize(text: str) -> list[str]:
+    """Lowercased word tokens, splitting on punctuation/underscores *and* camelCase/
+    letter-digit boundaries. Chunks the camelCase regex can't handle (non-ASCII
+    words) are kept whole rather than dropped."""
+    tokens: list[str] = []
+    for chunk in _WORD_CHUNK_RE.findall(text):
+        parts = _CAMEL_TOKEN_RE.findall(chunk)
+        if "".join(parts) == chunk:
+            tokens.extend(part.lower() for part in parts)
+        else:
+            tokens.append(chunk.lower())
+    return tokens
+
+
+@dataclass
+class _SearchEntry:
+    uri: str
+    kinds: set[str] = field(default_factory=set)
+    types: list[str] = field(default_factory=list)
+    label: Optional[str] = None
+    texts: list[str] = field(default_factory=list)
+
+
+@dataclass
+class _SearchIndex:
+    entries: list[_SearchEntry]
+    postings: dict[str, list[tuple[int, int]]]
+    """token -> [(entry index, term frequency in that entry's document)]"""
+    doc_lengths: list[int]
+    avg_doc_length: float
+
+
+def _build_search_index(store: Store) -> _SearchIndex:
+    by_uri: dict[str, _SearchEntry] = {}
+
+    def _entry(uri: str) -> _SearchEntry:
+        entry = by_uri.get(uri)
+        if entry is None:
+            entry = by_uri[uri] = _SearchEntry(uri=uri)
+        return entry
+
+    result = store.query("SELECT ?s ?p ?o WHERE { ?s ?p ?o }", timeout=120.0)
+    labels: dict[str, tuple[int, str]] = {}
+    for s, p, o in result.rows:
+        if p is None or o is None or s is None:
+            continue
+        _entry(p.value).kinds.add("predicate")
+        if s.kind != "uri":
+            continue
+        subject = _entry(s.value)
+        if o.kind == "uri":
+            obj = _entry(o.value)
+            if p.value == RDF_TYPE_URI:
+                obj.kinds.add("class")
+                subject.types.append(o.value)
+                if o.value in _CLASS_TYPE_URIS:
+                    subject.kinds.add("class")
+                elif o.value in _PROPERTY_TYPE_URIS:
+                    subject.kinds.add("predicate")
+            elif p.value == RDFS_SUBCLASS_OF_URI:
+                subject.kinds.add("class")
+                obj.kinds.add("class")
+        elif o.kind == "literal" and o.datatype in (None, XSD_STRING_URI, RDF_LANGSTRING_URI):
+            if len(o.value) <= SEARCH_MAX_LITERAL_CHARS:
+                subject.texts.append(o.value)
+            if p.value in _LABEL_PREDICATE_URIS:
+                # Prefer rdfs:label over skos:prefLabel, and an English/untagged label over others.
+                rank = _LABEL_PREDICATE_URIS.index(p.value) * 2 + (0 if o.language in (None, "en") else 1)
+                if s.value not in labels or rank < labels[s.value][0]:
+                    labels[s.value] = (rank, o.value)
+
+    entries = sorted(by_uri.values(), key=lambda e: e.uri)
+    postings: dict[str, list[tuple[int, int]]] = {}
+    doc_lengths: list[int] = []
+    for idx, entry in enumerate(entries):
+        if not entry.kinds:
+            entry.kinds.add("instance")
+        if entry.uri in labels:
+            entry.label = labels[entry.uri][1]
+        name_tokens = _tokenize(_local_name(entry.uri))
+        tokens = name_tokens * 2
+        for type_uri in entry.types:
+            tokens.extend(_tokenize(_local_name(type_uri)))
+        for text in entry.texts:
+            tokens.extend(_tokenize(text))
+        counts = Counter(tokens)
+        for token, tf in counts.items():
+            postings.setdefault(token, []).append((idx, tf))
+        doc_lengths.append(len(tokens))
+    avg = (sum(doc_lengths) / len(doc_lengths)) if doc_lengths else 0.0
+    return _SearchIndex(entries=entries, postings=postings, doc_lengths=doc_lengths, avg_doc_length=avg)
+
+
+def _get_search_index(dataset: str) -> _SearchIndex:
+    store = _require_dataset(dataset)
+    index = _search_indexes.get(dataset)
+    if index is None:
+        index = _search_indexes[dataset] = _build_search_index(store)
+    return index
+
+
+def _bm25_scores(index: _SearchIndex, text: str) -> dict[int, float]:
+    n_docs = len(index.entries)
+    scores: dict[int, float] = {}
+    for token in set(_tokenize(text)):
+        postings = index.postings.get(token)
+        if not postings:
+            continue
+        idf = math.log((n_docs - len(postings) + 0.5) / (len(postings) + 0.5) + 1.0)
+        for idx, tf in postings:
+            norm = BM25_K1 * (1 - BM25_B + BM25_B * index.doc_lengths[idx] / (index.avg_doc_length or 1.0))
+            scores[idx] = scores.get(idx, 0.0) + idf * tf * (BM25_K1 + 1) / (tf + norm)
+    return scores
+
+
+def search(
+    dataset: str,
+    text: str,
+    mode: Literal["bm25", "regex"] = "bm25",
+    kind: Literal["any", "class", "predicate", "instance"] = "any",
+    limit: int = 10,
+) -> dict[str, Any]:
+    """Find nodes in `dataset` by keyword or regex -- use it to get the URI for a concept
+    before writing SPARQL against it.
+
+    `mode="bm25"` (default) ranks nodes by keyword relevance over their local names (split into
+    words, so "supply air temp" matches `Supply_Air_Temperature_Sensor`), their types' names, and
+    their string literals (labels, comments, definitions). `mode="regex"` matches a Python regex
+    against each node's full URI, CURIE, and string literals (case-sensitive; prefix `(?i)` to
+    ignore case); `total_matches` counts every regex match, not just the `limit` returned. `kind`
+    restricts results to classes, predicates, or instances. Follow up with `traverse` to explore
+    a hit.
+    """
+    index = _get_search_index(dataset)
+    prefixes = _datasets[dataset].prefixes
+    used_prefixes: set[str] = set()
+    if limit < 1:
+        raise ValueError("limit must be at least 1")
+
+    def _keep(entry: _SearchEntry) -> bool:
+        return kind == "any" or kind in entry.kinds
+
+    matched_text: dict[int, str] = {}
+    if mode == "bm25":
+        scores = _bm25_scores(index, text)
+        ranked = sorted(
+            (idx for idx in scores if _keep(index.entries[idx])),
+            key=lambda idx: (-scores[idx], index.entries[idx].uri),
+        )
+    elif mode == "regex":
+        try:
+            pattern = re.compile(text)
+        except re.error as exc:
+            raise ValueError(f"invalid regex {text!r}: {exc}") from exc
+        name_hits: list[int] = []
+        text_hits: list[int] = []
+        for idx, entry in enumerate(index.entries):
+            if not _keep(entry):
+                continue
+            curie, _ = _uri_to_curie(entry.uri, prefixes)
+            if pattern.search(entry.uri) or pattern.search(curie):
+                name_hits.append(idx)
+                continue
+            for literal in entry.texts:
+                if pattern.search(literal):
+                    matched_text[idx] = literal if len(literal) <= 120 else literal[:117] + "..."
+                    text_hits.append(idx)
+                    break
+        ranked = name_hits + text_hits  # name matches first; each group is already in URI order
+        scores = {}
+    else:
+        raise ValueError("mode must be 'bm25' or 'regex'")
+
+    results = []
+    for idx in ranked[:limit]:
+        entry = index.entries[idx]
+        hit: dict[str, Any] = {
+            "uri": _display_curie(entry.uri, prefixes, used_prefixes),
+            "kinds": sorted(entry.kinds),
+            "types": [_display_curie(t, prefixes, used_prefixes) for t in sorted(set(entry.types))[:3]],
+        }
+        if entry.label is not None:
+            hit["label"] = entry.label
+        if mode == "bm25":
+            hit["score"] = round(scores[idx], 3)
+        elif idx in matched_text:
+            hit["matched_text"] = matched_text[idx]
+        results.append(hit)
+
+    response: dict[str, Any] = {"results": results}
+    if mode == "regex":
+        # A BM25 "match" is any node sharing even one word with `text`, so a count of them
+        # says nothing useful; a regex match count does (e.g. how many AHUs there are).
+        response["total_matches"] = len(ranked)
+    response["prefixes"] = {p: prefixes[p] for p in sorted(used_prefixes)}
+    if not results:
+        response["message"] = "No matches. Try other keywords or synonyms, a looser regex, or kind='any'."
+    elif mode == "regex":
+        response["message"] = f"{len(ranked)} match(es); showing {len(results)}."
+    else:
+        response["message"] = f"Top {len(results)} by keyword relevance."
+    return response
+
+
+# ==============================================================================
+#  TOOLSETS
+# ==============================================================================
+#
+# Every tool's description is sent to the agent on every turn, so each tool costs
+# context whether or not it's used. The toolset picks which tools get registered:
+# `core` is the original five; `extended` (the default) adds `search` and
+# `traverse`. The server-level instructions change with it, so a `core` agent is
+# never told about tools it doesn't have.
+
+TOOLSETS: dict[str, tuple[Callable[..., Any], ...]] = {
+    "core": (load_dataset, list_datasets, summarize_schema, diagnose, query),
+    "extended": (load_dataset, list_datasets, summarize_schema, diagnose, query, search, traverse),
+}
+_TOOLSET_INSTRUCTIONS = {"core": _CORE_INSTRUCTIONS, "extended": _EXTENDED_INSTRUCTIONS}
+DEFAULT_TOOLSET = "extended"
+TOOLSET_ENV_VAR = "SPARQL_RELAX_TOOLSET"
+
+
+def build_server(toolset: str = DEFAULT_TOOLSET) -> FastMCP:
+    """A FastMCP server registering exactly `toolset`'s tools, with instructions to match.
+    All servers built here share this module's loaded datasets and caches."""
+    if toolset not in TOOLSETS:
+        raise ValueError(f"unknown toolset {toolset!r}; choose one of: {', '.join(sorted(TOOLSETS))}")
+    server = FastMCP(name="sparql-relax", instructions=_TOOLSET_INSTRUCTIONS[toolset])
+    for fn in TOOLSETS[toolset]:
+        server.add_tool(fn)
+    return server
+
+
+mcp = build_server()
+
+
+def _parse_toolset(argv: Optional[list[str]] = None) -> str:
+    """`--toolset` if given, else `$SPARQL_RELAX_TOOLSET`, else `DEFAULT_TOOLSET`."""
+    parser = argparse.ArgumentParser(prog="sparql-relax-mcp", description="MCP server for exploring and debugging SPARQL/RDF graphs.")
+    parser.add_argument(
+        "--toolset",
+        choices=sorted(TOOLSETS),
+        default=None,
+        help=f"which tools to expose (default: ${TOOLSET_ENV_VAR} if set, else {DEFAULT_TOOLSET!r}). "
+        "'core' is load_dataset/list_datasets/summarize_schema/diagnose/query; 'extended' adds search and traverse.",
+    )
+    args = parser.parse_args(argv)
+    toolset = args.toolset or os.environ.get(TOOLSET_ENV_VAR) or DEFAULT_TOOLSET
+    if toolset not in TOOLSETS:
+        parser.error(f"${TOOLSET_ENV_VAR}={toolset!r} isn't a known toolset; choose one of: {', '.join(sorted(TOOLSETS))}")
+    return toolset
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    toolset = _parse_toolset(argv)
+    server = mcp if toolset == DEFAULT_TOOLSET else build_server(toolset)
     try:
-        mcp.run(transport="stdio")
+        server.run(transport="stdio")
     finally:
         # `daemon=True` already ensures the worker (if any) dies with this
         # process even without this, but shutting it down explicitly first

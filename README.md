@@ -49,6 +49,29 @@ that need to understand and query a knowledge graph.
   returns what's expected without spending context on a full result set; pass a higher `row_limit`
   (or `null`) once you actually need more.
 
+The default `extended` toolset (see [Choosing a toolset](#choosing-a-toolset)) adds two tools for
+exploring a graph before or between queries:
+
+- **`search(dataset, text, mode="bm25", kind="any", limit=10)`** — find the URI for a concept
+  instead of guessing it. `mode="bm25"` ranks nodes by keyword relevance over their local names
+  (split into words, so `supply air temp` matches `Supply_Air_Temperature_Sensor` and `has point`
+  matches `hasPoint`), their `rdf:type`s' names, and their string literals (labels, comments,
+  definitions, BACnet names, ...). `mode="regex"` matches a Python regex against each node's URI,
+  CURIE and string literals, and also returns `total_matches`. `kind` narrows results to
+  `class`, `predicate` or `instance`. The index is built once per dataset on first use (a few
+  seconds for a ~16MB graph) and rebuilt when `load_dataset` replaces it. Classes are only as
+  searchable as what's loaded: a data graph that references `brick:` classes without including
+  the Brick ontology has no definitions or hierarchy for them, so load the ontology into the
+  same dataset when that matters.
+- **`traverse(dataset, start, direction="outgoing", predicates=None, max_depth=3,
+  max_nodes=100)`** — breadth-first walk from `start`, returned level by level. Each node appears
+  once, at the depth where it was first reached, and `via` lists every `[previous_node, predicate]` edge into it, so
+  multiple inheritance shows up as several `via` entries instead of duplicated paths, and cycles
+  (e.g. `brick:feeds` loops) end on their own. `predicates` limits which edges are followed
+  (omit it to follow all of them); for a taxonomy, outgoing `rdfs:subClassOf` walks up and
+  incoming walks down. Literals are leaves and blank nodes are skipped. `truncated` and
+  `more_beyond_max_depth` report when there's more than was returned.
+
 **Intended workflow:** `load_dataset`, then `summarize_schema` once to understand the graph's
 shape. From there, `diagnose` is the tool for almost every query — call it before trusting a
 query's result, even when you expect it to succeed; it's nearly free when the query works, tells
@@ -201,7 +224,19 @@ uv sync
 
 ### Register with Claude Code
 
-Pointed at github: 
+Pointed at github, do this in two steps the first time. `claude mcp add` gives a stdio server only
+~30s to complete its startup handshake (Claude Code's default `MCP_TIMEOUT`), but the *first* run
+of the `uvx` command below has to clone the repo and compile the `sparql-relax-rs`/`bschema-rs`
+Rust extensions from scratch, which can easily take longer than that -- and shows up as a
+"failed to connect"/timeout error that has nothing to do with the URL or your setup. Run the same
+command directly once first, so `uv` builds and caches the extensions outside of that timeout:
+
+```sh
+uvx --from git+https://github.com/lazlop/kgqa-tools sparql-relax-mcp
+```
+
+It talks stdio, so once the build finishes it will just sit there waiting for input -- that means
+it's ready. Press Ctrl-C to stop it, then register it (fast now, since the build is cached):
 
 ```sh
 claude mcp add sparql-relax -- uvx --from git+https://github.com/lazlop/kgqa-tools sparql-relax-mcp
@@ -213,7 +248,9 @@ Pointed at a local clone:
 claude mcp add sparql-relax -- uv --directory /absolute/path/to/kgqa-tools run sparql-relax-mcp
 ```
 
-or by hand, in `.mcp.json`, using the GitHub install directly (no local path needed):
+or by hand, in `.mcp.json`, using the GitHub install directly (no local path needed -- run the
+priming step above first here too, since Claude Code applies the same startup timeout when it
+loads `.mcp.json`):
 
 ```json
 {
@@ -238,6 +275,26 @@ or pointed at a local clone instead:
   }
 }
 ```
+
+### Choosing a toolset
+
+Every tool's description is sent to the agent on every turn, so each tool costs context. The
+server exposes one of two toolsets:
+
+- **`extended`** (default): all seven tools — the core five plus `search` and `traverse`.
+- **`core`**: just `load_dataset`, `list_datasets`, `summarize_schema`, `diagnose` and `query`.
+
+Pick one with `--toolset` after the command, or with the `SPARQL_RELAX_TOOLSET` environment
+variable (the flag wins if both are set). The server's instructions to the agent change to match,
+so a `core` agent is never told about tools it doesn't have.
+
+```sh
+claude mcp add sparql-relax -- uvx --from git+https://github.com/lazlop/kgqa-tools sparql-relax-mcp --toolset core
+# or
+claude mcp add sparql-relax -e SPARQL_RELAX_TOOLSET=core -- uvx --from git+https://github.com/lazlop/kgqa-tools sparql-relax-mcp
+```
+
+In `.mcp.json`, append `"--toolset", "core"` to `args`.
 
 ### Register with Claude Desktop
 

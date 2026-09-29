@@ -10,7 +10,7 @@ import re
 import pytest
 from mcp.shared.memory import create_connected_server_and_client_session
 
-from sparql_relax_mcp.server import _datasets, _schema_summaries, mcp
+from sparql_relax_mcp.server import TOOLSET_ENV_VAR, _datasets, _parse_toolset, _schema_summaries, build_server, mcp
 
 # Uses the Brick namespace (rather than an arbitrary made-up one) because diagnose's
 # connection path search defaults to Brick/223P/RDFS/QUDT predicates only (see
@@ -51,11 +51,41 @@ def _result_json(call_tool_result) -> dict:
     return call_tool_result.structuredContent
 
 
+CORE_TOOLS = {"load_dataset", "list_datasets", "summarize_schema", "diagnose", "query"}
+
+
 @pytest.mark.asyncio
-async def test_lists_all_five_tools():
+async def test_default_server_is_extended_toolset():
     async with create_connected_server_and_client_session(mcp) as client:
         tools = (await client.list_tools()).tools
-        assert {t.name for t in tools} == {"load_dataset", "list_datasets", "summarize_schema", "diagnose", "query"}
+        assert {t.name for t in tools} == CORE_TOOLS | {"search", "traverse"}
+    assert "use search" in mcp.instructions and "use traverse" in mcp.instructions
+
+
+@pytest.mark.asyncio
+async def test_core_toolset_has_only_the_original_five_tools_and_instructions():
+    core = build_server("core")
+    async with create_connected_server_and_client_session(core) as client:
+        tools = (await client.list_tools()).tools
+        assert {t.name for t in tools} == CORE_TOOLS
+    # A core agent shouldn't be told about tools it doesn't have.
+    assert "use search" not in core.instructions and "traverse" not in core.instructions
+
+
+def test_build_server_rejects_unknown_toolset():
+    with pytest.raises(ValueError):
+        build_server("everything")
+
+
+def test_toolset_selection_flag_then_env_then_default(monkeypatch):
+    monkeypatch.delenv(TOOLSET_ENV_VAR, raising=False)
+    assert _parse_toolset([]) == "extended"
+    monkeypatch.setenv(TOOLSET_ENV_VAR, "core")
+    assert _parse_toolset([]) == "core"
+    assert _parse_toolset(["--toolset", "extended"]) == "extended"
+    monkeypatch.setenv(TOOLSET_ENV_VAR, "bogus")
+    with pytest.raises(SystemExit):
+        _parse_toolset([])
 
 
 @pytest.mark.asyncio
@@ -469,3 +499,164 @@ async def test_replacing_a_dataset_is_reflected_in_diagnose_not_served_stale():
         await client.call_tool("load_dataset", {"name": "b223", "data": replacement_ttl})
         second = _result_json(await client.call_tool("diagnose", {"dataset": "b223", "query": WORKING_QUERY}))
         assert second["row_count"] == 1
+
+
+# A small taxonomy with multiple inheritance (SAT_Sensor has two parents, which both
+# lead to Sensor), plus instances with literals, a blank node, and a feeds cycle.
+TAXONOMY_TTL = """
+@prefix brick: <https://brickschema.org/schema/Brick#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix ex: <urn:ex#> .
+brick:SAT_Sensor rdfs:subClassOf brick:Air_Temperature_Sensor, brick:Supply_Air_Sensor .
+brick:Air_Temperature_Sensor rdfs:subClassOf brick:Sensor .
+brick:Supply_Air_Sensor rdfs:subClassOf brick:Sensor .
+brick:Sensor rdfs:subClassOf brick:Point ;
+    rdfs:comment "Measures a physical quantity" .
+ex:ahu1 a brick:AHU ; brick:feeds ex:vav1 ; rdfs:label "Rooftop unit 1" .
+ex:vav1 a brick:VAV ; brick:feeds ex:ahu1 ; brick:hasPoint ex:sat1 .
+ex:sat1 a brick:SAT_Sensor ; brick:hasUnit [ rdfs:label "degF" ] ; ex:bacnetName "AHU-1 SAT" .
+"""
+
+
+async def _load_taxonomy(client) -> None:
+    _result_json(await client.call_tool("load_dataset", {"name": "tax", "data": TAXONOMY_TTL}))
+
+
+@pytest.mark.asyncio
+async def test_traverse_multiple_inheritance_is_a_dag_not_duplicated_paths():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await _load_taxonomy(client)
+        result = _result_json(
+            await client.call_tool(
+                "traverse", {"dataset": "tax", "start": "brick:SAT_Sensor", "predicates": ["rdfs:subClassOf"], "max_depth": 5}
+            )
+        )
+        levels = {lvl["depth"]: {n["node"]: n["via"] for n in lvl["nodes"]} for lvl in result["levels"]}
+        assert set(levels[1]) == {"brick:Air_Temperature_Sensor", "brick:Supply_Air_Sensor"}
+        # Sensor is reached from both parents: listed once, with both edges.
+        assert sorted(levels[2]["brick:Sensor"]) == [
+            ["brick:Air_Temperature_Sensor", "rdfs:subClassOf"],
+            ["brick:Supply_Air_Sensor", "rdfs:subClassOf"],
+        ]
+        assert set(levels[3]) == {"brick:Point"}
+        assert result["node_count"] == 4
+        assert result["truncated"] is False and result["more_beyond_max_depth"] is False
+
+
+@pytest.mark.asyncio
+async def test_traverse_incoming_walks_down_a_taxonomy():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await _load_taxonomy(client)
+        result = _result_json(
+            await client.call_tool(
+                "traverse",
+                {"dataset": "tax", "start": "brick:Sensor", "direction": "incoming", "predicates": ["rdfs:subClassOf"], "max_depth": 1},
+            )
+        )
+        assert {n["node"] for n in result["levels"][1]["nodes"]} == {"brick:Air_Temperature_Sensor", "brick:Supply_Air_Sensor"}
+        # SAT_Sensor is one level further down.
+        assert result["more_beyond_max_depth"] is True
+
+
+@pytest.mark.asyncio
+async def test_traverse_terminates_on_cycles_and_records_the_back_edge():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await _load_taxonomy(client)
+        result = _result_json(
+            await client.call_tool("traverse", {"dataset": "tax", "start": "ex:ahu1", "predicates": ["brick:feeds"], "max_depth": 10})
+        )
+        assert result["node_count"] == 1
+        assert result["levels"][0]["nodes"][0]["via"] == [["ex:vav1", "brick:feeds"]]
+
+
+@pytest.mark.asyncio
+async def test_traverse_all_predicates_literals_are_leaves_and_blank_nodes_skipped():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await _load_taxonomy(client)
+        result = _result_json(await client.call_tool("traverse", {"dataset": "tax", "start": "ex:sat1", "max_depth": 2}))
+        depth1 = {n["node"] for n in result["levels"][1]["nodes"]}
+        assert depth1 == {"brick:SAT_Sensor", '"AHU-1 SAT"'}
+        assert result["blank_node_edges_skipped"] == 1
+        # The literal isn't expanded; the class is.
+        assert {n["node"] for n in result["levels"][2]["nodes"]} == {"brick:Air_Temperature_Sensor", "brick:Supply_Air_Sensor"}
+
+
+@pytest.mark.asyncio
+async def test_traverse_max_nodes_truncates():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await _load_taxonomy(client)
+        result = _result_json(
+            await client.call_tool(
+                "traverse", {"dataset": "tax", "start": "brick:SAT_Sensor", "predicates": ["rdfs:subClassOf"], "max_nodes": 2}
+            )
+        )
+        assert result["node_count"] == 1
+        assert result["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_traverse_rejects_unknown_prefix():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await _load_taxonomy(client)
+        result = await client.call_tool("traverse", {"dataset": "tax", "start": "brik:Sensor"})
+        assert result.isError
+
+
+@pytest.mark.asyncio
+async def test_search_bm25_splits_compound_names_and_filters_by_kind():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await _load_taxonomy(client)
+        result = _result_json(await client.call_tool("search", {"dataset": "tax", "text": "air temperature sensor", "kind": "class"}))
+        assert result["results"][0]["uri"] == "brick:Air_Temperature_Sensor"
+        assert all("class" in r["kinds"] for r in result["results"])
+        assert "total_matches" not in result
+
+        preds = _result_json(await client.call_tool("search", {"dataset": "tax", "text": "has point", "kind": "predicate"}))
+        assert preds["results"][0]["uri"] == "brick:hasPoint"
+
+
+@pytest.mark.asyncio
+async def test_search_bm25_matches_labels_and_other_string_literals():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await _load_taxonomy(client)
+        rooftop = _result_json(await client.call_tool("search", {"dataset": "tax", "text": "rooftop", "kind": "instance"}))
+        assert rooftop["results"][0]["uri"] == "ex:ahu1"
+        assert rooftop["results"][0]["label"] == "Rooftop unit 1"
+        assert rooftop["results"][0]["types"] == ["brick:AHU"]
+
+        physical = _result_json(await client.call_tool("search", {"dataset": "tax", "text": "physical quantity"}))
+        assert physical["results"][0]["uri"] == "brick:Sensor"
+
+
+@pytest.mark.asyncio
+async def test_search_regex_matches_names_before_literals_and_counts_all():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await _load_taxonomy(client)
+        result = _result_json(await client.call_tool("search", {"dataset": "tax", "text": "(?i)ahu", "mode": "regex", "limit": 1}))
+        assert result["total_matches"] == 3  # brick:AHU, ex:ahu1 by name; ex:sat1 by its "AHU-1 SAT" literal
+        assert len(result["results"]) == 1
+
+        literal_hit = _result_json(await client.call_tool("search", {"dataset": "tax", "text": "AHU-1", "mode": "regex"}))
+        assert literal_hit["results"] == [
+            {"uri": "ex:sat1", "kinds": ["instance"], "types": ["brick:SAT_Sensor"], "matched_text": "AHU-1 SAT"}
+        ]
+
+
+@pytest.mark.asyncio
+async def test_search_rejects_invalid_regex():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await _load_taxonomy(client)
+        result = await client.call_tool("search", {"dataset": "tax", "text": "(unclosed", "mode": "regex"})
+        assert result.isError
+
+
+@pytest.mark.asyncio
+async def test_search_index_is_rebuilt_when_a_dataset_is_replaced():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await _load_taxonomy(client)
+        first = _result_json(await client.call_tool("search", {"dataset": "tax", "text": "rooftop"}))
+        assert first["results"]
+
+        await client.call_tool("load_dataset", {"name": "tax", "data": TTL})
+        second = _result_json(await client.call_tool("search", {"dataset": "tax", "text": "rooftop"}))
+        assert second["results"] == []
