@@ -1037,14 +1037,6 @@ def summarize_schema(
     itself, and so `run_query`, still sees every triple. Instance data typed with those classes
     (`ex:vav1 a brick:VAV`) is kept, and so is the data's own namespace, as long as the data
     isn't in the same namespace as the ontology it's bundled with.
-
-    Going beyond strictly removing the ontology, `exclude_ontology` also drops inferred
-    superclass types from the instance data: `ex:vav1 a brick:Terminal_Unit` goes when
-    `ex:vav1 a brick:VAV` is there too and the bundled ontology says `brick:VAV` is a subclass of
-    it. Those triples are data, not ontology, but a reasoner adds them unevenly and they only add
-    noise to a summary. The bundled `rdfs:subClassOf` hierarchy is all that's used, so a graph
-    bundling only part of its ontology keeps any type whose subclass link isn't in it.
-    `ontology_triples_removed` and `inferred_types_removed` report the two counts separately.
     """
     cached = _schema_summaries.get(dataset, {}).get(exclude_ontology)
     if cached is None:
@@ -1056,11 +1048,15 @@ def summarize_schema(
         rdflib_format = _RDFLIB_FORMATS[ds.format]
         data_graph = Graph(store="Oxigraph")
         data_graph.parse(data=ds.data, format=rdflib_format)
-        ontology_triples_removed = inferred_types_removed = 0
+        ontology_triples_removed = 0
         if exclude_ontology:
+            # Going beyond strictly removing the ontology, this also drops inferred superclass
+            # types from the instance data (see _remove_inferred_superclass_types and the
+            # README). Deliberately left out of this tool's docstring and response: it's a
+            # summary-quality detail that would only distract an agent reading them.
             hierarchy = _subclass_hierarchy(data_graph)
             ontology_triples_removed = _strip_ontology(data_graph)
-            inferred_types_removed = _remove_inferred_superclass_types(data_graph, hierarchy)
+            _remove_inferred_superclass_types(data_graph, hierarchy)
 
         # use_original_names=False: name each derived class after its members' shared rdf:type
         # (e.g. bs:VAV_version_1) instead of one arbitrary member's own IRI local name (e.g.
@@ -1106,7 +1102,6 @@ def summarize_schema(
             "original_size": original_size,
             "class_graph_size": len(class_graph),
             "ontology_triples_removed": ontology_triples_removed,
-            "inferred_types_removed": inferred_types_removed,
         }
         _schema_summaries.setdefault(dataset, {})[exclude_ontology] = cached
 
@@ -1122,11 +1117,9 @@ def summarize_schema(
     }
     if exclude_ontology:
         result["ontology_triples_removed"] = cached["ontology_triples_removed"]
-        result["inferred_types_removed"] = cached["inferred_types_removed"]
         message += (
             f" Removed {cached['ontology_triples_removed']} ontology triple(s) (class, property and "
-            f"SHACL shape definitions) and {cached['inferred_types_removed']} inferred superclass "
-            "rdf:type triple(s) before summarizing; the triple counts above exclude them."
+            "SHACL shape definitions) before summarizing; the triple counts above exclude them."
         )
     if include_member_counts:
         result["member_counts"] = cached["member_counts"]

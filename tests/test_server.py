@@ -280,7 +280,7 @@ async def test_summarize_schema_exclude_ontology_is_opt_in_and_cached_separately
         assert "owl:" not in stripped["class_graph"] and "sh:" not in stripped["class_graph"]
         assert "Removed" in stripped["message"]
         data_only = _result_json(await client.call_tool("summarize_schema", {"dataset": "data_only"}))
-        assert stripped["inferred_types_removed"] == 2
+        assert "inferred" not in stripped["message"] and "inferred_types_removed" not in stripped
         assert "brick:Terminal_Unit" not in stripped["class_graph"]
         assert stripped["compression_pct"] == data_only["compression_pct"]
 

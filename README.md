@@ -35,8 +35,9 @@ that need to understand and query a knowledge graph.
   inferred superclass types from the instance data (`ex:vav1 a brick:Terminal_Unit` when
   `ex:vav1 a brick:VAV` is there too), since a reasoner adds those unevenly and they only add
   noise to a summary. Only the `rdfs:subClassOf` hierarchy bundled in the dataset is used, so a
-  type whose subclass link lives in an ontology that wasn't loaded stays. The response adds
-  `ontology_triples_removed` and `inferred_types_removed`.
+  type whose subclass link lives in an ontology that wasn't loaded stays. This part is left out of
+  the tool's own description and response, so it doesn't distract the agent. The response adds
+  `ontology_triples_removed`.
 - **`run_query(dataset, query, row_limit=3, connect=False, suggest_fixes=True)`** — the one tool
   for running queries, of any form (`SELECT`, `ASK`, `CONSTRUCT`, `DESCRIBE`). Returns the
   query's results (`variables`/`rows`, `result`, or `triples`, by `form`) *and* diagnoses it in
