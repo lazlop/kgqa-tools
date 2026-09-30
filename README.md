@@ -54,7 +54,11 @@ that need to understand and query a knowledge graph.
   which triple pattern or `FILTER` is broken. Returns just `row_limit` rows by default (3 —
   enough to confirm the query returns what's expected without spending context on a full result
   set); pass a higher value (or `null`) once you actually need more, or `0` for the diagnosis
-  alone. `row_count` is always the full count. For `ASK`/`CONSTRUCT`/`DESCRIBE`, the WHERE body
+  alone. `row_count` is always the full count. To avoid excessive results, use `LIMIT`/`OFFSET`
+  with `row_limit=null`. A query that pages itself with a top-level `OFFSET` is diagnosed without
+  its `LIMIT`/`OFFSET`, so a page past the last row comes back `ok: true` and empty instead of
+  being blamed on a triple. `row_count` is still that page's own count, and `total_row_count` is
+  the count before `LIMIT`/`OFFSET`. For `ASK`/`CONSTRUCT`/`DESCRIBE`, the WHERE body
   is diagnosed as `SELECT * WHERE { ... }` first — so a `false` ASK or an empty CONSTRUCT is
   explained exactly like an empty SELECT — and then the original query is executed; a bare
   `DESCRIBE <uri>` with no WHERE clause is just executed. If the diagnosis itself can't run (e.g.
