@@ -83,7 +83,7 @@ The default `extended` toolset (see [Choosing a toolset](#choosing-a-toolset)) a
 exploring a graph before or between queries:
 
 - **`search(dataset, text, mode="bm25", kind="any", limit=10, include_predicates=None,
-  include_cbd=False)`** — find the URI for a concept
+  include_cbd=False, include_cbd_symmetric=False)`** — find the URI for a concept
   instead of guessing it. `mode="bm25"` ranks nodes by keyword relevance over their local names
   (split into words, so `supply air temp` matches `Supply_Air_Temperature_Sensor` and `has point`
   matches `hasPoint`), their `rdf:type`s' names, and their string literals (labels, comments,
@@ -95,7 +95,7 @@ exploring a graph before or between queries:
   the Brick ontology has no definitions or hierarchy for them, so load the ontology into the
   same dataset when that matters.
 
-  Two options return more about each hit, for telling candidates apart without a follow-up query.
+  Three options return more about each hit, for telling candidates apart without a follow-up query.
   `include_predicates` (e.g. `["rdfs:label", "skos:definition", "rdfs:subClassOf"]`) adds a
   `properties` map with each hit's values for just those predicates. `include_cbd=True` adds a
   `cbd`: the hit's [concise bounded description](https://www.w3.org/submission/CBD/) — every
@@ -103,6 +103,29 @@ exploring a graph before or between queries:
   `sh:rule` tag blocks and 223P's property shapes are included) — as Turtle, using the
   response's `prefixes`. A CBD is capped at 200 triples (`cbd_truncated` says when that cut it
   short); lower `limit` when using it, since a Brick or 223P class's CBD can be dozens of triples.
+
+  `include_cbd_symmetric=True` adds the rest of the *symmetric* CBD — what points at each hit —
+  as a separate `incoming` next to `cbd`, so "what this is" and "what references it" stay
+  apart:
+  - `incoming.direct` maps each predicate to the named nodes using it on the hit (a class's
+    subclasses and instances, `brick:feeds` from upstream equipment, ...), at most 20 each and
+    then `"... and N more"` — in a building graph, `rdf:type` on a class can be every instance.
+  - `incoming.referenced_in` has one entry per nested structure that references the hit from
+    inside blank nodes: a SHACL `sh:property [ sh:path ...; sh:class X ]`, an OWL restriction or
+    `owl:AllDisjointClasses` list. Each entry has:
+    - `owner`: the named node the structure hangs off (`null` when nothing names it);
+    - `paths`: how the hit is reached from the owner, e.g.
+      `sh:or[2] / sh:property / sh:qualifiedValueShape / sh:node / sh:property / sh:hasValue`
+      (`[i]` is a 1-based RDF list position; at most 5 paths);
+    - `turtle`: the structure itself, shown *whole* from its owner down, so the `sh:path` and
+      `sh:message` that explain the reference come along. The one exception is a list that
+      leads to the hit (an `sh:or`'s alternatives): its blank-node members that don't
+      reference the hit are dropped and the list relinked;
+    - `pruned` (only when that happened): notes like
+      `"sh:or: 1 of 2 members omitted (it doesn't reference the hit)"`.
+
+    Whole entries are added until a 200-triple budget is spent, and `referenced_in_omitted`
+    counts any that didn't fit.
 
 **Intended workflow:** `load_dataset`, then `summarize_schema` once to understand the graph's
 shape. From there, `run_query` for every query — it's nearly free when the query works, tells you
