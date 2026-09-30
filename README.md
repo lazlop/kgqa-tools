@@ -83,7 +83,7 @@ The default `extended` toolset (see [Choosing a toolset](#choosing-a-toolset)) a
 exploring a graph before or between queries:
 
 - **`search(dataset, text, mode="bm25", kind="any", limit=10, include_predicates=None,
-  include_cbd=False)`** — find the URI for a concept
+  include_cbd=False, include_cbd_symmetric=False)`** — find the URI for a concept
   instead of guessing it. `mode="bm25"` ranks nodes by keyword relevance over their local names
   (split into words, so `supply air temp` matches `Supply_Air_Temperature_Sensor` and `has point`
   matches `hasPoint`), their `rdf:type`s' names, and their string literals (labels, comments,
@@ -95,14 +95,19 @@ exploring a graph before or between queries:
   the Brick ontology has no definitions or hierarchy for them, so load the ontology into the
   same dataset when that matters.
 
-  Two options return more about each hit, for telling candidates apart without a follow-up query.
+  Three options return more about each hit, for telling candidates apart without a follow-up query.
   `include_predicates` (e.g. `["rdfs:label", "skos:definition", "rdfs:subClassOf"]`) adds a
   `properties` map with each hit's values for just those predicates. `include_cbd=True` adds a
   `cbd`: the hit's [concise bounded description](https://www.w3.org/submission/CBD/) — every
   triple with it as subject, plus the same recursively for any blank node objects (so Brick's
   `sh:rule` tag blocks and 223P's property shapes are included) — as Turtle, using the
-  response's `prefixes`. A CBD is capped at 200 triples (`cbd_truncated` says when that cut it
-  short); lower `limit` when using it, since a Brick or 223P class's CBD can be dozens of triples.
+  response's `prefixes`. `include_cbd_symmetric=True` makes that `cbd` the *symmetric* CBD: it
+  also has every triple with the hit as object (a class's instances and subclasses, `brick:feeds`
+  from upstream equipment, ...), following blank node subjects back to the named node that owns
+  them (so a SHACL shape's `sh:property [ sh:class X ]` shows up on `X`). A CBD is capped at 200
+  triples, outbound triples first (`cbd_truncated` says when that cut it short); lower `limit`
+  when using it, since a Brick or 223P class's CBD can be dozens of triples, and a popular
+  class's symmetric CBD far more.
 
 **Intended workflow:** `load_dataset`, then `summarize_schema` once to understand the graph's
 shape. From there, `run_query` for every query — it's nearly free when the query works, tells you

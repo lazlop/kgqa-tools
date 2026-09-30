@@ -979,6 +979,37 @@ async def test_search_include_cbd_follows_blank_nodes_as_turtle():
 
 
 @pytest.mark.asyncio
+async def test_search_include_cbd_symmetric_adds_inbound_triples_through_blank_nodes():
+    shape_ttl = TAXONOMY_TTL + (
+        "@prefix sh: <http://www.w3.org/ns/shacl#> .\n"
+        "ex:Shape sh:property [ sh:qualifiedValueShape [ sh:class brick:Sensor ] ] .\n"
+    )
+    async with create_connected_server_and_client_session(mcp) as client:
+        _result_json(await client.call_tool("load_dataset", {"name": "tax", "data": shape_ttl}))
+        args = {"dataset": "tax", "text": "^brick:Sensor$", "mode": "regex"}
+        plain = _result_json(await client.call_tool("search", {**args, "include_cbd": True}))["results"][0]
+        result = _result_json(await client.call_tool("search", {**args, "include_cbd_symmetric": True}))
+        hit = result["results"][0]
+        assert hit["uri"] == "brick:Sensor"
+        assert "cbd_truncated" not in hit
+        parsed = Graph().parse(
+            data="".join(f"@prefix {p}: <{ns}> .\n" for p, ns in result["prefixes"].items()) + hit["cbd"], format="turtle"
+        )
+        # Outbound: subClassOf Point, comment. Inbound: the two subclasses, plus the shape
+        # followed back through both blank nodes to the named ex:Shape.
+        assert len(parsed) == 7
+        assert "ex:Shape" in hit["cbd"] and "brick:Supply_Air_Sensor" in hit["cbd"]
+        assert "ex:Shape" not in plain["cbd"]
+
+        # A class with more instances than the cap: the instances are what gets cut.
+        crowded = shape_ttl + "".join(f"ex:s{i} a brick:Sensor .\n" for i in range(300))
+        _result_json(await client.call_tool("load_dataset", {"name": "tax", "data": crowded}))
+        hit = _result_json(await client.call_tool("search", {**args, "include_cbd_symmetric": True}))["results"][0]
+        assert hit["cbd_truncated"] is True
+        assert "ex:Shape" in hit["cbd"] and "brick:Supply_Air_Sensor" in hit["cbd"]
+
+
+@pytest.mark.asyncio
 async def test_search_rejects_unknown_prefix_in_include_predicates():
     async with create_connected_server_and_client_session(mcp) as client:
         await _load_taxonomy(client)

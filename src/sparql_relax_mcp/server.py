@@ -84,7 +84,8 @@ _EXTENDED_INSTRUCTIONS = _CORE_INSTRUCTIONS + (
     "comments and other string literals) or by regex -- instead of guessing names and letting "
     "run_query catch the guess. To judge which hit is the right one, have search return more "
     "about each: include_predicates (e.g. ['rdfs:label', 'skos:definition', 'rdfs:subClassOf']) "
-    "for just those values, or include_cbd=true for each hit's full concise bounded description."
+    "for just those values, include_cbd=true for each hit's full concise bounded description, "
+    "or include_cbd_symmetric=true to also see the triples pointing at each hit."
 )
 
 
@@ -1991,6 +1992,9 @@ SEARCH_CBD_MAX_TRIPLES = 200
 """Per-hit cap on the triples rendered for `include_cbd` -- a Brick or 223P class's CBD is
 usually a few dozen triples, but an instance hub (or a class carrying a large SHACL shape) can
 have far more, and `limit` hits each carry their own."""
+SEARCH_CBD_MAX_BNODE_DEPTH = 8
+"""How many blank nodes deep `include_cbd_symmetric` follows inbound references -- one
+query per level, and real RDF lists / SHACL shapes rarely nest deeper."""
 SEARCH_MAX_PREDICATE_VALUES = 20
 """Per-hit, per-predicate cap on the values `include_predicates` returns."""
 
@@ -2008,19 +2012,68 @@ def _term_to_rdflib(term: Term) -> Any:
     return RDFLiteral(term.value, datatype=datatype)
 
 
-def _cbd_turtle(store: Store, uri: str, prefixes: dict[str, str], used: set[str]) -> tuple[str, bool]:
+def _inbound_triples(store: Store, uri: str, limit: int) -> list[tuple[Any, Any, Any]]:
+    """The inverse half of a symmetric CBD, as rdflib triples: every triple with `uri` as
+    object, plus, for any blank node subject, the triples with *that* blank node as object,
+    recursively -- so a reference from inside a nested structure (a SHACL
+    `sh:property [ sh:class X ]`) is shown up to the named node that owns it. Blank nodes can't
+    be named in SPARQL, so depth k is its own query chaining k-1 blank nodes back to `uri`;
+    blank node ids are stable across queries, so the levels join up. Stops after
+    `SEARCH_CBD_MAX_BNODE_DEPTH` levels; each level reads at most `limit + 1` rows. `?x a
+    <uri>` triples (a class's instances, possibly thousands) sort last, so when the caller
+    cuts at `limit` they go before the rarer subclass and shape references do."""
+    triples: list[tuple[Any, Any, Any]] = []
+    seen: set[tuple[Any, Any, Any]] = set()
+    for depth in range(1, SEARCH_CBD_MAX_BNODE_DEPTH + 1):
+        if depth == 1:
+            # `false` orders before `true`, so the LIMIT keeps non-`rdf:type` triples first.
+            query = f"SELECT DISTINCT ?s ?p WHERE {{ ?s ?p <{uri}> . }} ORDER BY (?p = <{RDF.type}>)"
+        else:
+            chain = " ".join(f"?b{i} ?q{i} ?b{i + 1} ." for i in range(1, depth - 1))
+            blank = " && ".join(f"isBlank(?b{i})" for i in range(1, depth))
+            query = (
+                f"SELECT DISTINCT ?s ?p ?b1 WHERE {{ ?s ?p ?b1 . {chain} "
+                f"?b{depth - 1} ?q{depth - 1} <{uri}> . FILTER({blank}) }}"
+            )
+        level_has_bnode = False
+        for row in store.query(f"{query} LIMIT {limit + 1}").rows:
+            obj = _term_to_rdflib(row[2]) if depth > 1 else URIRef(uri)
+            triple = (_term_to_rdflib(row[0]), _term_to_rdflib(row[1]), obj)
+            if triple in seen:
+                continue
+            seen.add(triple)
+            triples.append(triple)
+            level_has_bnode |= row[0].kind == "bnode"
+        if not level_has_bnode:
+            break
+    target = URIRef(uri)
+    return sorted(triples, key=lambda t: t[1] == RDF.type and t[2] == target)
+
+
+def _cbd_turtle(
+    store: Store, uri: str, prefixes: dict[str, str], used: set[str], symmetric: bool = False
+) -> tuple[str, bool]:
     """`uri`'s concise bounded description -- what the store's `DESCRIBE` returns: every
     triple with `uri` as subject, plus the same recursively for any blank node objects -- as
     Turtle with its `@prefix` lines stripped (the response's `prefixes` carries them instead,
-    same as every other tool). Blank nodes referenced once nest inline as `[ ... ]`. Returns
-    the text and whether `SEARCH_CBD_MAX_TRIPLES` cut it short."""
-    triples = store.query(f"DESCRIBE <{uri}>").triples or []
+    same as every other tool). Blank nodes referenced once nest inline as `[ ... ]`. With
+    `symmetric`, the symmetric CBD: `_inbound_triples` appended after the outbound ones (so a
+    cut drops inbound triples first, and among those, instances first). Returns the text and whether `SEARCH_CBD_MAX_TRIPLES`
+    cut it short."""
+    triples = [
+        (_term_to_rdflib(s), _term_to_rdflib(p), _term_to_rdflib(o))
+        for s, p, o in store.query(f"DESCRIBE <{uri}>").triples or []
+    ]
+    if symmetric and len(triples) <= SEARCH_CBD_MAX_TRIPLES:
+        outbound = set(triples)  # a self-loop (`uri ?p uri`) is in both halves
+        inbound = _inbound_triples(store, uri, SEARCH_CBD_MAX_TRIPLES - len(triples))
+        triples += [t for t in inbound if t not in outbound]
     truncated = len(triples) > SEARCH_CBD_MAX_TRIPLES
     graph = Graph(bind_namespaces="none")
     for prefix, namespace in prefixes.items():
         graph.bind(prefix, namespace, override=True, replace=True)
-    for s, p, o in triples[:SEARCH_CBD_MAX_TRIPLES]:
-        graph.add((_term_to_rdflib(s), _term_to_rdflib(p), _term_to_rdflib(o)))
+    for triple in triples[:SEARCH_CBD_MAX_TRIPLES]:
+        graph.add(triple)
     text = graph.serialize(format="turtle")
     # rdflib only emits the bindings it actually used; any it had to invent itself (`ns1:`)
     # get added to `prefixes` so the stripped text still resolves.
@@ -2069,6 +2122,7 @@ def search(
     limit: int = 10,
     include_predicates: Optional[list[str]] = None,
     include_cbd: bool = False,
+    include_cbd_symmetric: bool = False,
 ) -> dict[str, Any]:
     """Find nodes in `dataset` by keyword or regex -- use it to get the URI for a concept
     before writing SPARQL against it.
@@ -2086,8 +2140,12 @@ def search(
     predicate is listed, empty if the hit has none). `include_cbd=True` adds `cbd`: the hit's
     concise bounded description -- every triple with it as subject, plus the same for any blank
     node objects, recursively (so Brick `sh:rule` tag blocks and 223P property shapes are
-    included) -- as Turtle using this response's `prefixes`. A CBD is capped at
-    200 triples (`cbd_truncated: true` when cut); lower `limit` when using it.
+    included) -- as Turtle using this response's `prefixes`. `include_cbd_symmetric=True`
+    makes `cbd` the symmetric CBD instead: also every triple with the hit as *object* (who
+    points at it -- a class's instances and subclasses, `brick:feeds` from upstream),
+    following blank node subjects back to the named node that owns them (so a SHACL shape's
+    `sh:property [ sh:class X ]` shows up on X). A CBD is capped at 200 triples, outbound
+    first (`cbd_truncated: true` when cut); lower `limit` when using it.
     """
     index = _get_search_index(dataset)
     store = _datasets[dataset].store
@@ -2154,8 +2212,10 @@ def search(
             hit["matched_text"] = matched_text[idx]
         if predicate_uris:
             hit["properties"] = properties[entry.uri]
-        if include_cbd:
-            hit["cbd"], cbd_truncated = _cbd_turtle(store, entry.uri, prefixes, used_prefixes)
+        if include_cbd or include_cbd_symmetric:
+            hit["cbd"], cbd_truncated = _cbd_turtle(
+                store, entry.uri, prefixes, used_prefixes, symmetric=include_cbd_symmetric
+            )
             if cbd_truncated:
                 hit["cbd_truncated"] = True
         results.append(hit)
