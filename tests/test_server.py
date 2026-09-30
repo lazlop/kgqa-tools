@@ -579,6 +579,86 @@ async def test_run_query_default_row_limit_is_three():
         assert len(result["rows"]) == 3
 
 
+PAGED_TTL = TTL + "\n".join(f"ex:sensor{i} a ex:TempSensor ." for i in range(3, 8))  # 7 sensors
+
+
+@pytest.mark.asyncio
+async def test_run_query_pages_with_limit_offset_in_the_query():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await client.call_tool("load_dataset", {"name": "b223", "data": PAGED_TTL})
+        everything = _result_json(await client.call_tool("run_query", {"dataset": "b223", "query": WORKING_QUERY, "row_limit": None}))
+        assert "total_row_count" not in everything
+
+        pages = [
+            _result_json(
+                await client.call_tool(
+                    "run_query", {"dataset": "b223", "query": f"{WORKING_QUERY} LIMIT 3 OFFSET {offset}", "row_limit": None}
+                )
+            )
+            for offset in (0, 3, 6)
+        ]
+        assert [p["row_count"] for p in pages] == [3, 3, 1]
+        assert [p.get("total_row_count") for p in pages] == [None, 7, 7]  # OFFSET 0 isn't paging
+        assert all(p["ok"] for p in pages)
+        assert [r for p in pages for r in p["rows"]] == everything["rows"]
+
+
+@pytest.mark.asyncio
+async def test_run_query_offset_past_the_end_is_not_diagnosed_as_broken():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await client.call_tool("load_dataset", {"name": "b223", "data": PAGED_TTL})
+        for query in (f"{WORKING_QUERY} LIMIT 3 OFFSET 10", f"{WORKING_QUERY} OFFSET 10"):
+            result = _result_json(await client.call_tool("run_query", {"dataset": "b223", "query": query, "row_limit": None}))
+            assert result["ok"] is True, query
+            assert result["rows"] == [], query
+            assert result["row_count"] == 0, query
+            assert result["total_row_count"] == 7, query
+            assert result["culprits"] == [], query
+            assert "past the last one" in result["message"], query
+
+
+@pytest.mark.asyncio
+async def test_run_query_still_diagnoses_a_broken_query_that_pages_itself():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
+        result = _result_json(
+            await client.call_tool("run_query", {"dataset": "b223", "query": BROKEN_QUERY + " LIMIT 10 OFFSET 10"})
+        )
+        assert result["ok"] is False
+        assert result["total_row_count"] == 0
+        assert result["culprits"][0]["triples"][0]["triple"] == "ex:building223 ex:hasSensor ?sensor"
+
+
+@pytest.mark.asyncio
+async def test_run_query_offset_in_a_subquery_is_left_alone():
+    # The subquery's OFFSET 10 empties it; the outer query has no OFFSET of its own, so it's
+    # diagnosed as written rather than having the subquery's LIMIT/OFFSET stripped.
+    query = (
+        "PREFIX ex: <https://brickschema.org/schema/Brick#> "
+        "SELECT ?s WHERE { { SELECT ?s WHERE { ?s a ex:TempSensor } LIMIT 3 OFFSET 10 } }"
+    )
+    async with create_connected_server_and_client_session(mcp) as client:
+        await client.call_tool("load_dataset", {"name": "b223", "data": PAGED_TTL})
+        result = _result_json(await client.call_tool("run_query", {"dataset": "b223", "query": query}))
+        assert result["row_count"] == 0
+        assert "total_row_count" not in result
+
+
+@pytest.mark.asyncio
+async def test_run_query_construct_pages_with_offset_in_the_query():
+    query = (
+        "PREFIX ex: <https://brickschema.org/schema/Brick#> "
+        "CONSTRUCT { ?s a ex:Thing } WHERE { ?s a ex:TempSensor } ORDER BY ?s LIMIT 5 OFFSET 5"
+    )
+    async with create_connected_server_and_client_session(mcp) as client:
+        await client.call_tool("load_dataset", {"name": "b223", "data": PAGED_TTL})
+        result = _result_json(await client.call_tool("run_query", {"dataset": "b223", "query": query, "row_limit": None}))
+        assert result["ok"] is True
+        assert result["row_count"] == 2
+        assert result["total_row_count"] == 7
+        assert len(result["triples"]) == 2
+
+
 @pytest.mark.asyncio
 async def test_run_query_ask_and_construct_forms():
     async with create_connected_server_and_client_session(mcp) as client:

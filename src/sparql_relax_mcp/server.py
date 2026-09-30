@@ -1220,6 +1220,28 @@ def _as_select_over_where_body(query: str) -> Optional[str]:
     return prologue + "SELECT * WHERE " + query[body_start:]
 
 
+_SLICE_RE = re.compile(r"(?<![\w:?$])(LIMIT|OFFSET)\s+(\d+)", re.I)
+
+
+def _strip_top_level_offset(query: str) -> Optional[tuple[str, Optional[int], int]]:
+    """When `query` pages itself with a top-level `OFFSET n` (n > 0), returns `(query with its
+    top-level LIMIT/OFFSET removed, the LIMIT or None, the OFFSET)`; otherwise `None`. Only
+    LIMIT/OFFSET after the query's last `}` count as top-level, so a subquery's are left alone
+    (and so is a query ending in a trailing `VALUES` block, which is just not recognized)."""
+    masked = _mask_sparql(query)
+    tail_start = masked.rfind("}") + 1
+    if tail_start == 0:
+        return None
+    matches = list(_SLICE_RE.finditer(masked, tail_start))
+    values = {m.group(1).upper(): int(m.group(2)) for m in matches}
+    if not values.get("OFFSET"):
+        return None
+    stripped = query
+    for m in reversed(matches):
+        stripped = stripped[: m.start()] + stripped[m.end() :]
+    return stripped, values.get("LIMIT"), values["OFFSET"]
+
+
 def run_query(
     dataset: str,
     query: str,
@@ -1238,14 +1260,18 @@ def run_query(
     confirm the query returns what you expect without spending context on a full result set.
     Pass a higher value, or `null` for no limit, once you actually need the results (e.g. to hand
     them back to the user), or `0` for the diagnosis alone. It has no effect on ASK, and never
-    affects `row_count`, which is always the full count.
+    affects `row_count`, which is always the full count. To avoid excessive results, use
+    LIMIT/OFFSET with row_limit=null.
 
     `row_count` counts solutions of the query's WHERE pattern: for SELECT, that's its own rows;
     for ASK/CONSTRUCT/DESCRIBE, the query is diagnosed as `SELECT * WHERE { <its WHERE body> }`
     first (so an ASK that's `false`, or a CONSTRUCT that builds nothing, is explained the same
     way an empty SELECT is), then the original query itself is executed for `result`/`triples`.
     A bare `DESCRIBE <uri>` with no WHERE clause has nothing to diagnose and is just executed
-    (`row_count: null`). If the diagnosis itself can't run -- e.g. the pattern is only
+    (`row_count: null`). A query that pages itself with a top-level `OFFSET` is diagnosed without
+    its LIMIT/OFFSET, so an OFFSET past the last row isn't mistaken for a broken query:
+    `row_count` is still this page's own count, and `total_row_count` is the count before
+    LIMIT/OFFSET. If the diagnosis itself can't run -- e.g. the pattern is only
     all-variable triples like `?s ?p ?o`, which there's nothing to ablate in -- the query is still
     executed and the reason is reported in `diagnosis_error`.
 
@@ -1306,6 +1332,12 @@ def run_query(
     form = _query_form(query)
     is_select = form == "SELECT"
     diagnosed_query = query if is_select else _as_select_over_where_body(query)
+    # A page past the last row matches nothing, which the diagnosis would otherwise blame on a
+    # triple -- so a self-paging query is diagnosed without its LIMIT/OFFSET, and its own row
+    # count is worked out from the total (LIMIT/OFFSET are always applied last).
+    page = _strip_top_level_offset(diagnosed_query) if diagnosed_query is not None else None
+    if page is not None:
+        diagnosed_query, page_limit, page_offset = page
     rows_limit = _UNLIMITED_ROWS if row_limit is None else row_limit
 
     def _fixes_for(raw_triples: list[str]) -> list[dict[str, Any]]:
@@ -1346,7 +1378,7 @@ def run_query(
                     "diagnose",
                     diagnosed_query,
                     ignore_cartesian_risk=False,
-                    sample_limit=rows_limit if is_select else 0,
+                    sample_limit=rows_limit if is_select and page is None else 0,
                     expand_nonempty_results=False,
                 )
         except RuntimeError as exc:
@@ -1390,7 +1422,7 @@ def run_query(
             for f in report.filter_culprits
         ]
         cartesian_risks = report.cartesian_risks
-        if is_select:
+        if is_select and page is None:
             # diagnose already ran the query in full to count it, so its sample *is* the result.
             sampled = (report.sample_variables, report.sample_rows)
 
@@ -1434,7 +1466,12 @@ def run_query(
     cartesian_risks_skipped = [
         {"triples": [_abbrev(t) for t in r.triples], "depth": r.depth} for r in cartesian_risks
     ]
-    row_count = report.original_row_count if report is not None else None
+    total_row_count = report.original_row_count if report is not None else None
+    row_count = total_row_count
+    if page is not None and total_row_count is not None:
+        row_count = max(0, total_row_count - page_offset)
+        if page_limit is not None:
+            row_count = min(row_count, page_limit)
     fixed_culprit_count = sum(1 for c in culprits if c["suggested_fixes"])
 
     if report is None:
@@ -1445,9 +1482,16 @@ def run_query(
             message = f"Query executed, but couldn't be diagnosed ({diagnosis_error}) -- check its results yourself."
     else:
         ok = report.original_row_count > 0 and not culprits and not filter_issues
-        if ok:
-            message = f"Query's pattern matched {report.original_row_count} row(s) with no issues found."
-            if result["form"] != "boolean" and row_limit is not None and report.original_row_count > row_limit:
+        if ok and page is not None and row_count == 0:
+            message = (
+                f"Query's pattern matched {total_row_count} row(s) with no issues found, but OFFSET "
+                f"{page_offset} is past the last one, so this page is empty."
+            )
+        elif ok:
+            message = f"Query's pattern matched {row_count} row(s) with no issues found."
+            if page is not None:
+                message += f" ({total_row_count} before LIMIT/OFFSET.)"
+            if result["form"] != "boolean" and row_limit is not None and row_count > row_limit:
                 message += f" Only {row_limit} returned (row_limit) -- raise it, or pass null, if you need more."
         elif culprits or filter_issues:
             if fixed_culprit_count:
@@ -1483,6 +1527,7 @@ def run_query(
         "ok": ok,
         **result,
         "row_count": row_count,
+        **({"total_row_count": total_row_count} if page is not None else {}),
         "culprits": culprits,
         "filter_issues": filter_issues,
         "cartesian_risks_skipped": cartesian_risks_skipped,
