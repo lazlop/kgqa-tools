@@ -77,7 +77,7 @@ For each group, look for an existing term before considering an extension:
 3. **Check the constraints on it.** Shapes in extensions can require a specific term. G36's
    `g36:Zone`, for example, expects the window switch to use `s223:Binary-OnOff`. In the same
    search call, `incoming.referenced_in` lists every shape that references the term, with its
-   owner and path. Without kgqa-tools, use query 5. If a shape conflicts with the exact
+   owner and the shape itself. Without kgqa-tools, use query 5. If a shape conflicts with the exact
    semantics, that's a judgement call to report, not something to resolve silently.
 4. **For Brick, check deprecation (query 8).** Search returns deprecated classes too.
 

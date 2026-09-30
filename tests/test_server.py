@@ -1029,14 +1029,12 @@ async def test_search_include_cbd_incoming_returns_incoming_separately():
 
         # The whole shape, not just the chain down to brick:Sensor: its sh:path and message too.
         shape = entries["ex:Shape"]
-        assert shape["paths"] == ["sh:property / sh:qualifiedValueShape / sh:class"]
         assert "pruned" not in shape
         assert len(_parse_turtle(result["prefixes"], shape["turtle"])) == 6
         assert "sh:path brick:hasPoint" in shape["turtle"] and '"needs a sensor"' in shape["turtle"]
 
         # The sh:or alternative that doesn't mention the hit is pruned, and the list relinked.
         or_shape = entries["ex:OrShape"]
-        assert or_shape["paths"] == ["sh:or[2] / sh:class"]
         assert or_shape["pruned"] == ["sh:or: 1 of 2 members omitted (it doesn't reference the hit)"]
         assert "brick:AHU" not in or_shape["turtle"] and "sh:path brick:hasUnit" in or_shape["turtle"]
         parsed = _parse_turtle(result["prefixes"], or_shape["turtle"])
@@ -1044,7 +1042,6 @@ async def test_search_include_cbd_incoming_returns_incoming_separately():
 
         # An unreferenced blank node is shown whole too; named list members are never pruned.
         disjoint = entries[None]
-        assert disjoint["paths"] == ["owl:members[2]"]
         assert "pruned" not in disjoint
         assert len(_parse_turtle(result["prefixes"], disjoint["turtle"])) == 6
         assert "owl:AllDisjointClasses" in disjoint["turtle"] and "brick:Point" in disjoint["turtle"]

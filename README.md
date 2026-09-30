@@ -133,9 +133,6 @@ exploring a graph before or between queries:
     inside blank nodes: a SHACL `sh:property [ sh:path ...; sh:class X ]`, an OWL restriction or
     `owl:AllDisjointClasses` list. Each entry has:
     - `owner`: the named node the structure hangs off (`null` when nothing names it);
-    - `paths`: how the hit is reached from the owner, e.g.
-      `sh:or[2] / sh:property / sh:qualifiedValueShape / sh:node / sh:property / sh:hasValue`
-      (`[i]` is a 1-based RDF list position; at most 5 paths);
     - `turtle`: the structure itself, shown *whole* from its owner down, so the `sh:path` and
       `sh:message` that explain the reference come along. The one exception is a list that
       leads to the hit (an `sh:or`'s alternatives): its blank-node members that don't

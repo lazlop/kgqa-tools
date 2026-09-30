@@ -2080,19 +2080,13 @@ def _bnode_subtree(triples: list[_RdfTriple], root: Any) -> list[_RdfTriple]:
     return subtree
 
 
-SEARCH_MAX_REFERENCE_PATHS = 5
-"""Per-`referenced_in`-entry cap on the paths listed from its owner down to the hit."""
-
-
 def _reference_entry(
-    triples: list[_RdfTriple], owner: Optional[str], edge: Optional[Any], root: Any, hit: str,
-    prefixes: dict[str, str], used: set[str],
+    triples: list[_RdfTriple], owner: Optional[str], hit: str, prefixes: dict[str, str], used: set[str]
 ) -> tuple[dict[str, Any], int]:
-    """One `referenced_in` entry for the blank node structure at `root` (reached from `owner`
-    by `edge`; both None when nothing names it), whose triples are `triples`: its `paths`
-    down to `hit`, and its Turtle with the RDF list members that don't lead to `hit` pruned
-    (an `sh:or`'s other alternatives), each pruning noted in `pruned`. Returns the entry and
-    its triple count after pruning."""
+    """One `referenced_in` entry for a blank node structure referencing `hit`, hanging off
+    `owner` (None when nothing names it), whose triples are `triples`: its Turtle with the RDF
+    list members that don't lead to `hit` pruned (an `sh:or`'s other alternatives), each
+    pruning noted in `pruned`. Returns the entry and its triple count after pruning."""
     target = URIRef(hit)
     out: dict[Any, list[tuple[Any, Any]]] = {}
     list_parents: dict[Any, Any] = {}  # list head -> the predicate pointing at it
@@ -2129,33 +2123,6 @@ def _reference_entry(
     def curie(term: Any) -> str:
         return _display_curie(str(term), prefixes, used)
 
-    paths: list[list[str]] = []
-
-    def walk_edge(pred: Any, obj: Any, parts: list[str], seen: frozenset) -> None:
-        step = curie(pred)
-        lst = list_of(obj)
-        if lst is not None:
-            for i, member in enumerate(lst[0], 1):
-                if member == target:
-                    paths.append([*parts, f"{step}[{i}]"])
-                elif reaches(member):
-                    walk_node(member, [*parts, f"{step}[{i}]"], seen)
-        elif obj == target:
-            paths.append([*parts, step])
-        elif reaches(obj):
-            walk_node(obj, [*parts, step], seen)
-
-    def walk_node(node: Any, parts: list[str], seen: frozenset) -> None:
-        if node in seen:
-            return
-        for pred, obj in out.get(node, []):
-            walk_edge(pred, obj, parts, seen | {node})
-
-    if edge is not None:
-        walk_edge(edge, root, [], frozenset())
-    else:
-        walk_node(root, [], frozenset())
-
     # Prune: in each list leading to the hit, drop the blank node members that don't.
     kept_triples = list(triples)
     pruned: list[str] = []
@@ -2186,10 +2153,6 @@ def _reference_entry(
         )
 
     entry: dict[str, Any] = {"owner": curie(owner) if owner is not None else None}
-    shown = [" / ".join(parts) for parts in paths[:SEARCH_MAX_REFERENCE_PATHS]]
-    if len(paths) > len(shown):
-        shown.append(f"... and {len(paths) - len(shown)} more")
-    entry["paths"] = shown
     entry["turtle"] = _triples_turtle(kept_triples, prefixes, used)
     if pruned:
         entry["pruned"] = pruned
@@ -2205,8 +2168,7 @@ def _incoming(store: Store, uri: str, prefixes: dict[str, str], used: set[str]) 
       every instance in a building graph).
     - `referenced_in`: each structure that references `uri` from inside a blank node (a
       SHACL `sh:property [ ... sh:class X ]`, an OWL restriction), one entry per structure
-      (see `_reference_entry`): its named `owner`, the `paths` from there down to `uri`, and
-      the named owner's edge into it plus the blank node subtree as Turtle -- whole, not just
+      (see `_reference_entry`): its named `owner` and the named owner's edge into it plus the blank node subtree as Turtle -- whole, not just
       the chain down to `uri`, since the `sh:path`, `sh:message` etc. are what explain the
       reference, except for list members (`sh:or` alternatives) that don't lead to `uri`.
       Whole entries are added until `SEARCH_CBD_MAX_TRIPLES` is spent (the first always is);
@@ -2284,7 +2246,7 @@ def _incoming(store: Store, uri: str, prefixes: dict[str, str], used: set[str]) 
             block = [(URIRef(owner), edge, root), *_bnode_subtree(described[owner], root)]
         else:
             block = list(dict.fromkeys(orphans[root]))
-        entry, size = _reference_entry(block, owner, edge, root, uri, prefixes, used)
+        entry, size = _reference_entry(block, owner, uri, prefixes, used)
         if entries and spent + size > SEARCH_CBD_MAX_TRIPLES:
             break
         entries.append(entry)
@@ -2360,9 +2322,8 @@ def search(
       predicate to the named nodes using it on the hit (subclasses, instances, `brick:feeds`
       from upstream), at most 20 each then `"... and N more"`. `referenced_in` lists the nested
       structures referencing it (a SHACL `sh:property [ sh:path ...; sh:class X ]`, an OWL
-      restriction), each with its named `owner` (null if none), the `paths` from owner to hit
-      (e.g. `sh:or[2] / sh:property / sh:class`), and `turtle`, the structure whole so its
-      `sh:path` and `sh:message` say *why* it references the hit (list alternatives that don't
+      restriction), each with its named `owner` (null if none) and `turtle`, the structure
+      whole so its `sh:path` and `sh:message` say *why* it references the hit (list alternatives that don't
       lead to the hit are dropped and noted in `pruned`); entries fill a 200-triple budget and
       `referenced_in_omitted` counts the rest. Use it to find a class's subclasses or an
       enumeration kind's members, and the shapes that constrain it. With `include_cbd` too,
