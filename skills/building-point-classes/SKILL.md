@@ -65,7 +65,7 @@ For each group, look for an existing term before considering an extension:
    Try synonyms before concluding nothing exists. "Running/Stopped" finds nothing, but it is
    `s223:Binary-OnOff`. `references/s223.md` has a synonym table for common state texts.
 2. **Inspect the candidate.** With kgqa-tools, one call covers this step and the next:
-   `search(dataset, "^s223:Binary-OnOff$", mode="regex", include_cbd_symmetric=True)`.
+   `search(dataset, "^s223:Binary-OnOff$", mode="regex", include_cbd=True, include_cbd_incoming=True)`.
    - `cbd` gives the definition and parents.
    - `incoming.direct["rdfs:subClassOf"]` lists the children. For an enumeration kind, these
      are its members.

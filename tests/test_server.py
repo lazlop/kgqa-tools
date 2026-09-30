@@ -981,6 +981,19 @@ async def test_search_include_cbd_follows_blank_nodes_as_turtle():
         assert '"degF"' in hit["cbd"]
 
 
+@pytest.mark.asyncio
+async def test_search_default_limit_drops_to_three_with_a_cbd():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await _load_taxonomy(client)
+        args = {"dataset": "tax", "text": ".", "mode": "regex"}
+        plain = _result_json(await client.call_tool("search", args))
+        assert len(plain["results"]) == 10 < plain["total_matches"]
+        for option in ("include_cbd", "include_cbd_incoming"):
+            assert len(_result_json(await client.call_tool("search", {**args, option: True}))["results"]) == 3
+        explicit = _result_json(await client.call_tool("search", {**args, "include_cbd": True, "limit": 5}))
+        assert len(explicit["results"]) == 5
+
+
 def _parse_turtle(prefixes: dict[str, str], text: str) -> Graph:
     return Graph().parse(data="".join(f"@prefix {p}: <{ns}> .\n" for p, ns in prefixes.items()) + text, format="turtle")
 
@@ -996,15 +1009,18 @@ ex:OrShape sh:or ( [ sh:class brick:AHU ; sh:minCount 1 ] [ sh:path brick:hasUni
 
 
 @pytest.mark.asyncio
-async def test_search_include_cbd_symmetric_returns_incoming_separately():
+async def test_search_include_cbd_incoming_returns_incoming_separately():
     async with create_connected_server_and_client_session(mcp) as client:
         _result_json(await client.call_tool("load_dataset", {"name": "tax", "data": SHAPES_TTL}))
         args = {"dataset": "tax", "text": "^brick:Sensor$", "mode": "regex"}
         plain = _result_json(await client.call_tool("search", {**args, "include_cbd": True}))["results"][0]
-        result = _result_json(await client.call_tool("search", {**args, "include_cbd_symmetric": True}))
+        result = _result_json(await client.call_tool("search", {**args, "include_cbd": True, "include_cbd_incoming": True}))
         hit = result["results"][0]
         # `cbd` stays outgoing-only; what points at the hit is in `incoming`.
         assert hit["cbd"] == plain["cbd"] and "incoming" not in plain
+        # The options are independent: incoming alone brings no `cbd`.
+        alone = _result_json(await client.call_tool("search", {**args, "include_cbd_incoming": True}))["results"][0]
+        assert "cbd" not in alone and alone["incoming"] == hit["incoming"]
         incoming = hit["incoming"]
         assert incoming["direct"] == {"rdfs:subClassOf": ["brick:Air_Temperature_Sensor", "brick:Supply_Air_Sensor"]}
         assert "referenced_in_omitted" not in incoming
@@ -1035,7 +1051,7 @@ async def test_search_include_cbd_symmetric_returns_incoming_separately():
 
 
 @pytest.mark.asyncio
-async def test_search_include_cbd_symmetric_caps_per_predicate_and_cuts_whole_entries():
+async def test_search_include_cbd_incoming_caps_per_predicate_and_cuts_whole_entries():
     shapes = "".join(
         f"ex:Shape{i} sh:property [ sh:path ex:p{i} ; sh:minCount 1 ; sh:class brick:Sensor ] .\n" for i in range(60)
     )
@@ -1044,7 +1060,7 @@ async def test_search_include_cbd_symmetric_caps_per_predicate_and_cuts_whole_en
         _result_json(await client.call_tool("load_dataset", {"name": "tax", "data": SHAPES_TTL + shapes + instances}))
         result = _result_json(
             await client.call_tool(
-                "search", {"dataset": "tax", "text": "^brick:Sensor$", "mode": "regex", "include_cbd_symmetric": True}
+                "search", {"dataset": "tax", "text": "^brick:Sensor$", "mode": "regex", "include_cbd_incoming": True}
             )
         )
         incoming = result["results"][0]["incoming"]

@@ -86,8 +86,8 @@ that need to understand and query a knowledge graph.
 The default `extended` toolset (see [Choosing a toolset](#choosing-a-toolset)) adds one tool for
 exploring a graph before or between queries:
 
-- **`search(dataset, text, mode="bm25", kind="any", limit=10, include_predicates=None,
-  include_cbd=False, include_cbd_symmetric=False)`** — find the URI for a concept
+- **`search(dataset, text, mode="bm25", kind="any", limit=None, include_predicates=None,
+  include_cbd=False, include_cbd_incoming=False)`** — find the URI for a concept
   instead of guessing it. `mode="bm25"` ranks nodes by keyword relevance over their local names
   (split into words, so `supply air temp` matches `Supply_Air_Temperature_Sensor` and `has point`
   matches `hasPoint`), their `rdf:type`s' names, and their string literals (labels, comments,
@@ -99,18 +99,33 @@ exploring a graph before or between queries:
   the Brick ontology has no definitions or hierarchy for them, so load the ontology into the
   same dataset when that matters.
 
-  Three options return more about each hit, for telling candidates apart without a follow-up query.
-  `include_predicates` (e.g. `["rdfs:label", "skos:definition", "rdfs:subClassOf"]`) adds a
-  `properties` map with each hit's values for just those predicates. `include_cbd=True` adds a
-  `cbd`: the hit's [concise bounded description](https://www.w3.org/submission/CBD/) — every
-  triple with it as subject, plus the same recursively for any blank node objects (so Brick's
-  `sh:rule` tag blocks and 223P's property shapes are included) — as Turtle, using the
-  response's `prefixes`. A CBD is capped at 200 triples (`cbd_truncated` says when that cut it
-  short); lower `limit` when using it, since a Brick or 223P class's CBD can be dozens of triples.
+  Three options return more about each hit, for telling candidates apart without a follow-up
+  query. They're listed cheapest first and combine freely:
 
-  `include_cbd_symmetric=True` adds the rest of the *symmetric* CBD — what points at each hit —
-  as a separate `incoming` next to `cbd`, so "what this is" and "what references it" stay
-  apart:
+  | Option | Adds | Use it for |
+  |---|---|---|
+  | `include_predicates=[...]` | `properties`: just those predicates' values | labels, definitions, parents across many hits |
+  | `include_cbd=True` | `cbd`: what the hit says about itself | a class's tags, constraints and full definition; an instance's own edges |
+  | `include_cbd_incoming=True` | `incoming`: what points at the hit | subclasses, an enumeration kind's members, the shapes that constrain it |
+
+  Since a Brick or 223P class's CBD can be dozens of triples, `limit` defaults to 3 hits
+  (instead of 10) whenever `include_cbd` or `include_cbd_incoming` is set; pass `limit`
+  explicitly to override. Measured over Brick and 223P, a keyword search returning a CBD per hit
+  is ~1–1.5k tokens at 3 hits and ~4–5k at 10.
+
+  `include_predicates` (e.g. `["rdfs:label", "skos:definition", "rdfs:subClassOf"]`) adds a
+  `properties` map with each hit's values for just those predicates; every requested predicate
+  is listed, empty if the hit has none.
+
+  `include_cbd=True` adds a `cbd`: the hit's
+  [concise bounded description](https://www.w3.org/submission/CBD/) — every triple with it as
+  subject, plus the same recursively for any blank node objects (so Brick's `sh:rule` tag blocks
+  and 223P's property shapes are included) — as Turtle, using the response's `prefixes`. It's
+  capped at 200 triples (`cbd_truncated` says when that cut it short).
+
+  `include_cbd_incoming=True` adds an `incoming`: what points *at* each hit. It's kept separate
+  from `cbd` so "what this is" and "what references it" stay apart; pass both to get the hit's
+  *symmetric* CBD.
   - `incoming.direct` maps each predicate to the named nodes using it on the hit (a class's
     subclasses and instances, `brick:feeds` from upstream equipment, ...), at most 20 each and
     then `"... and N more"` — in a building graph, `rdf:type` on a class can be every instance.
@@ -466,7 +481,7 @@ session after installing.
 
 The skill works best with:
 - **This MCP server registered** (see [Register with Claude Code](#register-with-claude-code)).
-  The skill uses `search` with `include_cbd_symmetric` to inspect candidate terms, and
+  The skill uses `search` with `include_cbd` and `include_cbd_incoming` to inspect candidate terms, and
   `run_query` for its SPARQL templates. Without the server it falls back to rdflib.
 - **The ontologies on disk**: 223P and Brick (see [Ontologies](#ontologies)), plus any
   extension whose shapes your model must satisfy, such as ASHRAE's G36 extension for 223P.
