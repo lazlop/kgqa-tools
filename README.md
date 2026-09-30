@@ -29,9 +29,14 @@ that need to understand and query a knowledge graph.
   (e.g. Brick's tags, quantities and substances), so the summary shows the data's patterns rather
   than the ontology's. A namespace counts as the ontology's when most of its subjects are
   ontology terms (or referenced only by them), so the data's own namespace stays even if it holds
-  an `owl:Ontology` header, as long as the data doesn't share a namespace with the ontology. Instance data typed with
-  those classes is kept, only the summary is affected (`run_query` still sees everything), and the
-  response adds `ontology_triples_removed`.
+  an `owl:Ontology` header, as long as the data doesn't share a namespace with the ontology.
+  Instance data typed with those classes is kept, and only the summary is affected (`run_query`
+  still sees everything). **This goes beyond strictly removing the ontology:** it also drops
+  inferred superclass types from the instance data (`ex:vav1 a brick:Terminal_Unit` when
+  `ex:vav1 a brick:VAV` is there too), since a reasoner adds those unevenly and they only add
+  noise to a summary. Only the `rdfs:subClassOf` hierarchy bundled in the dataset is used, so a
+  type whose subclass link lives in an ontology that wasn't loaded stays. The response adds
+  `ontology_triples_removed` and `inferred_types_removed`.
 - **`run_query(dataset, query, row_limit=3, connect=False, suggest_fixes=True)`** — the one tool
   for running queries, of any form (`SELECT`, `ASK`, `CONSTRUCT`, `DESCRIBE`). Returns the
   query's results (`variables`/`rows`, `result`, or `triples`, by `form`) *and* diagnoses it in

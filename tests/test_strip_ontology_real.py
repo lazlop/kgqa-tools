@@ -10,10 +10,16 @@ Graphs are compared after RDFC-1.0 canonicalization (via pyoxigraph -- rdflib's 
 `"x"^^xsd:string` as the same literal, as RDF 1.1 does; the cleaned files were re-serialized
 with the explicit datatype on every string.
 
-One caveat on "identical": for b59, remove_ontology.py also did two things that aren't ontology
-removal -- dropping inferred superclass types and renaming nodes after their labels -- so those
-two steps (`_remove_less_specific_classes`/`_rename_b59_nodes`, copied from that script) are
-applied to the stripped graph before comparing.
+The graphs go through what `summarize_schema(exclude_ontology=True)` does: strip the ontology,
+then drop inferred superclass types using the bundled hierarchy. Caveats on "identical":
+- remove_ontology.py dropped inferred superclass types against the *full* ontology files. b59
+  bundles only a slice of 223P, which misses the links above ~950 of them (s223:Equipment,
+  s223:Connectable, ...), so for b59 the full 223P pass (`_remove_less_specific_classes`) is
+  still applied on top, along with its node renaming (`_rename_b59_nodes`) -- both copied from
+  that script.
+- The other way round, bldg11's bundled Brick does link the 10 `brick:Command`s the reference
+  kept to a more specific type of theirs (`brick:Heating_Command`), so the same cleanup is
+  applied to the reference too, and exactly those 10 are asserted to be the difference.
 """
 
 from __future__ import annotations
@@ -24,7 +30,7 @@ import pyoxigraph
 import pytest
 from rdflib import RDF, RDFS, Graph, Namespace
 
-from sparql_relax_mcp.server import _strip_ontology
+from sparql_relax_mcp.server import _remove_inferred_superclass_types, _strip_ontology, _subclass_hierarchy
 
 KGQA_AGENT_DATA = Path(__file__).resolve().parents[2] / "kgqa-agent" / "data"
 EVAL_BUILDINGS_DIR = KGQA_AGENT_DATA / "eval_buildings"
@@ -75,11 +81,15 @@ def _rename_b59_nodes(graph: Graph) -> None:
 @pytest.mark.parametrize("building", ["bldg11.ttl", "b59.ttl", "TUC_building.ttl", "dflexlibs_multizone.ttl"])
 def test_strip_ontology_matches_hand_cleaned_graph(building):
     graph = Graph().parse(EVAL_BUILDINGS_DIR / building)
+    hierarchy = _subclass_hierarchy(graph)
     removed = _strip_ontology(graph)
+    _remove_inferred_superclass_types(graph, hierarchy)
     if building == "b59.ttl":
         graph = _remove_less_specific_classes(graph, Graph().parse(S223_ONTOLOGY))
         _rename_b59_nodes(graph)
     expected = Graph().parse(EVAL_BUILDINGS_DIR / "without-ontology" / building)
+    missed_by_reference = _remove_inferred_superclass_types(expected, hierarchy)
+    assert missed_by_reference == (10 if building == "bldg11.ttl" else 0)
 
     # bldg11 bundles Brick and b59 a slice of 223P; TUC and dflexlibs have no ontology at all,
     # so nothing may be removed from them (including their many data blank nodes).
