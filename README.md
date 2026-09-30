@@ -38,6 +38,15 @@ that need to understand and query a knowledge graph.
   type whose subclass link lives in an ontology that wasn't loaded stays. This part is left out of
   the tool's own description and response, so it doesn't distract the agent. The response adds
   `ontology_triples_removed`.
+
+  What counts as "ontology" here rests on assumptions drawn from how Brick and 223P are defined:
+  terms are typed as OWL/RDFS classes and properties or SHACL shapes (or with a metaclass, like
+  `s223:Class`, declared a subclass of `rdfs:Class`), their supporting structure hangs off them
+  as blank nodes, and the ontology lives in its own namespaces, separate from the instance data.
+  It was checked against Brick- and 223P-based building graphs (see
+  `tests/test_strip_ontology_real.py`). Other ontologies that are defined differently, or data
+  that shares a namespace with its ontology, may not be handled correctly, and these rules may be
+  updated in the future.
 - **`run_query(dataset, query, row_limit=3, connect=False, suggest_fixes=True)`** — the one tool
   for running queries, of any form (`SELECT`, `ASK`, `CONSTRUCT`, `DESCRIBE`). Returns the
   query's results (`variables`/`rows`, `result`, or `triples`, by `form`) *and* diagnoses it in
