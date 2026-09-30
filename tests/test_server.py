@@ -987,6 +987,7 @@ SHAPES_TTL = TAXONOMY_TTL + """
 @prefix owl: <http://www.w3.org/2002/07/owl#> .
 ex:Shape sh:property [ sh:path brick:hasPoint ; sh:message "needs a sensor" ;
     sh:qualifiedValueShape [ sh:class brick:Sensor ] ; sh:qualifiedMinCount 1 ] .
+ex:OrShape sh:or ( [ sh:class brick:AHU ; sh:minCount 1 ] [ sh:path brick:hasUnit ; sh:class brick:Sensor ] ) .
 [] a owl:AllDisjointClasses ; owl:members ( brick:Point brick:Sensor ) .
 """
 
@@ -1003,18 +1004,35 @@ async def test_search_include_cbd_symmetric_returns_incoming_separately():
         assert hit["cbd"] == plain["cbd"] and "incoming" not in plain
         incoming = hit["incoming"]
         assert incoming["direct"] == {"rdfs:subClassOf": ["brick:Air_Temperature_Sensor", "brick:Supply_Air_Sensor"]}
-        assert "blank_node_blocks_omitted" not in incoming
-        shape, disjoint = sorted(incoming["blank_node_blocks"], key=lambda b: "owl:" in b)
+        assert "referenced_in_omitted" not in incoming
+        entries = {e["owner"]: e for e in incoming["referenced_in"]}
+        assert set(entries) == {"ex:OrShape", "ex:Shape", None}
+
         # The whole shape, not just the chain down to brick:Sensor: its sh:path and message too.
-        assert len(_parse_turtle(result["prefixes"], shape)) == 6
-        assert "sh:path brick:hasPoint" in shape and '"needs a sensor"' in shape
-        # An unreferenced blank node is shown whole too -- the full member list and its type.
-        assert len(_parse_turtle(result["prefixes"], disjoint)) == 6
-        assert "owl:AllDisjointClasses" in disjoint and "brick:Point" in disjoint
+        shape = entries["ex:Shape"]
+        assert shape["paths"] == ["sh:property / sh:qualifiedValueShape / sh:class"]
+        assert "pruned" not in shape
+        assert len(_parse_turtle(result["prefixes"], shape["turtle"])) == 6
+        assert "sh:path brick:hasPoint" in shape["turtle"] and '"needs a sensor"' in shape["turtle"]
+
+        # The sh:or alternative that doesn't mention the hit is pruned, and the list relinked.
+        or_shape = entries["ex:OrShape"]
+        assert or_shape["paths"] == ["sh:or[2] / sh:class"]
+        assert or_shape["pruned"] == ["sh:or: 1 of 2 members omitted (it doesn't reference the hit)"]
+        assert "brick:AHU" not in or_shape["turtle"] and "sh:path brick:hasUnit" in or_shape["turtle"]
+        parsed = _parse_turtle(result["prefixes"], or_shape["turtle"])
+        assert len(parsed) == 5  # sh:or, one list node's first/rest, the kept member's path and class
+
+        # An unreferenced blank node is shown whole too; named list members are never pruned.
+        disjoint = entries[None]
+        assert disjoint["paths"] == ["owl:members[2]"]
+        assert "pruned" not in disjoint
+        assert len(_parse_turtle(result["prefixes"], disjoint["turtle"])) == 6
+        assert "owl:AllDisjointClasses" in disjoint["turtle"] and "brick:Point" in disjoint["turtle"]
 
 
 @pytest.mark.asyncio
-async def test_search_include_cbd_symmetric_caps_per_predicate_and_cuts_whole_blocks():
+async def test_search_include_cbd_symmetric_caps_per_predicate_and_cuts_whole_entries():
     shapes = "".join(
         f"ex:Shape{i} sh:property [ sh:path ex:p{i} ; sh:minCount 1 ; sh:class brick:Sensor ] .\n" for i in range(60)
     )
@@ -1030,14 +1048,14 @@ async def test_search_include_cbd_symmetric_caps_per_predicate_and_cuts_whole_bl
         types = incoming["direct"]["rdf:type"]
         assert types[:2] == ["ex:s000", "ex:s001"] and types[-1] == "... and 280 more" and len(types) == 21
         assert len(incoming["direct"]["rdfs:subClassOf"]) == 2
-        # 62 blocks (60 four-triple shapes, ex:Shape's, the disjointness axiom) don't fit in
-        # 200 triples; every block returned is whole, and the rest are counted.
-        blocks = incoming["blank_node_blocks"]
-        assert len(blocks) + incoming["blank_node_blocks_omitted"] == 62
-        for block in blocks:
-            if "ex:p" in block:
-                assert len(_parse_turtle(result["prefixes"], block)) == 4
-        assert sum(len(_parse_turtle(result["prefixes"], b)) for b in blocks) <= 200
+        # 63 entries (60 four-triple shapes, ex:Shape's, ex:OrShape's, the disjointness axiom)
+        # don't fit in 200 triples; every entry returned is whole, and the rest are counted.
+        entries = incoming["referenced_in"]
+        assert len(entries) + incoming["referenced_in_omitted"] == 63
+        for entry in entries:
+            if "ex:p" in entry["turtle"]:
+                assert len(_parse_turtle(result["prefixes"], entry["turtle"])) == 4
+        assert sum(len(_parse_turtle(result["prefixes"], e["turtle"])) for e in entries) <= 200
 
 
 @pytest.mark.asyncio

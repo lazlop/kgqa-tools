@@ -110,12 +110,22 @@ exploring a graph before or between queries:
   - `incoming.direct` maps each predicate to the named nodes using it on the hit (a class's
     subclasses and instances, `brick:feeds` from upstream equipment, ...), at most 20 each and
     then `"... and N more"` — in a building graph, `rdf:type` on a class can be every instance.
-  - `incoming.blank_node_blocks` has one Turtle block per nested structure that references the
-    hit from inside blank nodes: a SHACL `sh:property [ sh:path ...; sh:class X ]`, an OWL
-    restriction or `owl:AllDisjointClasses` list. Each is shown *whole*, from its named owner
-    down (or from its top blank node when nothing names it), so the `sh:path` and `sh:message`
-    that explain the reference come along. Whole blocks are added until a 200-triple budget is
-    spent, and `blank_node_blocks_omitted` counts any that didn't fit.
+  - `incoming.referenced_in` has one entry per nested structure that references the hit from
+    inside blank nodes: a SHACL `sh:property [ sh:path ...; sh:class X ]`, an OWL restriction or
+    `owl:AllDisjointClasses` list. Each entry has:
+    - `owner`: the named node the structure hangs off (`null` when nothing names it);
+    - `paths`: how the hit is reached from the owner, e.g.
+      `sh:or[2] / sh:property / sh:qualifiedValueShape / sh:node / sh:property / sh:hasValue`
+      (`[i]` is a 1-based RDF list position; at most 5 paths);
+    - `turtle`: the structure itself, shown *whole* from its owner down, so the `sh:path` and
+      `sh:message` that explain the reference come along. The one exception is a list that
+      leads to the hit (an `sh:or`'s alternatives): its blank-node members that don't
+      reference the hit are dropped and the list relinked;
+    - `pruned` (only when that happened): notes like
+      `"sh:or: 1 of 2 members omitted (it doesn't reference the hit)"`.
+
+    Whole entries are added until a 200-triple budget is spent, and `referenced_in_omitted`
+    counts any that didn't fit.
 
 **Intended workflow:** `load_dataset`, then `summarize_schema` once to understand the graph's
 shape. From there, `run_query` for every query — it's nearly free when the query works, tells you

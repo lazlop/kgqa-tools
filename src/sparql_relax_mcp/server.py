@@ -2067,6 +2067,122 @@ def _bnode_subtree(triples: list[_RdfTriple], root: Any) -> list[_RdfTriple]:
     return subtree
 
 
+SEARCH_MAX_REFERENCE_PATHS = 5
+"""Per-`referenced_in`-entry cap on the paths listed from its owner down to the hit."""
+
+
+def _reference_entry(
+    triples: list[_RdfTriple], owner: Optional[str], edge: Optional[Any], root: Any, hit: str,
+    prefixes: dict[str, str], used: set[str],
+) -> tuple[dict[str, Any], int]:
+    """One `referenced_in` entry for the blank node structure at `root` (reached from `owner`
+    by `edge`; both None when nothing names it), whose triples are `triples`: its `paths`
+    down to `hit`, and its Turtle with the RDF list members that don't lead to `hit` pruned
+    (an `sh:or`'s other alternatives), each pruning noted in `pruned`. Returns the entry and
+    its triple count after pruning."""
+    target = URIRef(hit)
+    out: dict[Any, list[tuple[Any, Any]]] = {}
+    list_parents: dict[Any, Any] = {}  # list head -> the predicate pointing at it
+    rest_objects = set()
+    for s_, p_, o_ in triples:
+        out.setdefault(s_, []).append((p_, o_))
+        if p_ == RDF.rest:
+            rest_objects.add(o_)
+        elif isinstance(o_, BNode):
+            list_parents.setdefault(o_, p_)
+
+    reach_memo: dict[Any, bool] = {}
+
+    def reaches(node: Any) -> bool:
+        if node == target:
+            return True
+        if not isinstance(node, BNode):
+            return False
+        if node not in reach_memo:
+            reach_memo[node] = False  # cycle guard
+            reach_memo[node] = any(reaches(o_) for _, o_ in out.get(node, []))
+        return reach_memo[node]
+
+    def list_of(node: Any) -> Optional[tuple[list[Any], list[Any]]]:
+        """(members, list nodes) if `node` heads an RDF list in `triples`, else None."""
+        members, nodes, seen = [], [], set()
+        while isinstance(node, BNode) and node not in seen and any(p_ == RDF.first for p_, _ in out.get(node, [])):
+            seen.add(node)
+            nodes.append(node)
+            members += [o_ for p_, o_ in out[node] if p_ == RDF.first]
+            node = next((o_ for p_, o_ in out[node] if p_ == RDF.rest), RDF.nil)
+        return (members, nodes) if nodes else None
+
+    def curie(term: Any) -> str:
+        return _display_curie(str(term), prefixes, used)
+
+    paths: list[list[str]] = []
+
+    def walk_edge(pred: Any, obj: Any, parts: list[str], seen: frozenset) -> None:
+        step = curie(pred)
+        lst = list_of(obj)
+        if lst is not None:
+            for i, member in enumerate(lst[0], 1):
+                if member == target:
+                    paths.append([*parts, f"{step}[{i}]"])
+                elif reaches(member):
+                    walk_node(member, [*parts, f"{step}[{i}]"], seen)
+        elif obj == target:
+            paths.append([*parts, step])
+        elif reaches(obj):
+            walk_node(obj, [*parts, step], seen)
+
+    def walk_node(node: Any, parts: list[str], seen: frozenset) -> None:
+        if node in seen:
+            return
+        for pred, obj in out.get(node, []):
+            walk_edge(pred, obj, parts, seen | {node})
+
+    if edge is not None:
+        walk_edge(edge, root, [], frozenset())
+    else:
+        walk_node(root, [], frozenset())
+
+    # Prune: in each list leading to the hit, drop the blank node members that don't.
+    kept_triples = list(triples)
+    pruned: list[str] = []
+    for head in list(out):
+        if head in rest_objects:
+            continue
+        lst = list_of(head)
+        if lst is None:
+            continue
+        members, nodes = lst
+        if not any(reaches(m) for m in members):
+            continue
+        keep = [m for m in members if not isinstance(m, BNode) or reaches(m)]
+        if len(keep) == len(members):
+            continue
+        drop: set[_RdfTriple] = {t for t in kept_triples if t[0] in nodes}
+        for member in members:
+            if member not in keep:
+                drop.update(_bnode_subtree(kept_triples, member))
+        kept_triples = [t for t in kept_triples if t not in drop]
+        for i, member in enumerate(keep):
+            kept_triples.append((nodes[i], RDF.first, member))
+            kept_triples.append((nodes[i], RDF.rest, nodes[i + 1] if i + 1 < len(keep) else RDF.nil))
+        where = curie(list_parents[head]) if head in list_parents else "a list"
+        dropped = len(members) - len(keep)
+        pruned.append(
+            f"{where}: {dropped} of {len(members)} members omitted ({'it doesn' if dropped == 1 else 'they don'}'t reference the hit)"
+        )
+
+    entry: dict[str, Any] = {"owner": curie(owner) if owner is not None else None}
+    shown = [" / ".join(parts) for parts in paths[:SEARCH_MAX_REFERENCE_PATHS]]
+    if len(paths) > len(shown):
+        shown.append(f"... and {len(paths) - len(shown)} more")
+    entry["paths"] = shown
+    entry["turtle"] = _triples_turtle(kept_triples, prefixes, used)
+    if pruned:
+        entry["pruned"] = pruned
+    return entry, len(kept_triples)
+
+
 def _incoming(store: Store, uri: str, prefixes: dict[str, str], used: set[str]) -> dict[str, Any]:
     """The other half of `uri`'s symmetric CBD -- what points at it -- kept apart from its
     CBD so "what this is" and "what references it" stay distinguishable:
@@ -2074,12 +2190,14 @@ def _incoming(store: Store, uri: str, prefixes: dict[str, str], used: set[str]) 
     - `direct`: named subjects of triples with `uri` as object, by predicate, at most
       `SEARCH_MAX_PREDICATE_VALUES` each then `"... and N more"` (a class's `rdf:type` can be
       every instance in a building graph).
-    - `blank_node_blocks`: each structure that references `uri` from inside a blank node (a
-      SHACL `sh:property [ ... sh:class X ]`, an OWL restriction), one Turtle block per
-      structure: the named owner's edge into it plus the *whole* blank node subtree, not just
-      the chain down to `uri` -- the `sh:path`, `sh:message` etc. are what explain the
-      reference. Whole blocks are added until `SEARCH_CBD_MAX_TRIPLES` is spent (the first
-      always is); `blank_node_blocks_omitted` counts the rest.
+    - `referenced_in`: each structure that references `uri` from inside a blank node (a
+      SHACL `sh:property [ ... sh:class X ]`, an OWL restriction), one entry per structure
+      (see `_reference_entry`): its named `owner`, the `paths` from there down to `uri`, and
+      the named owner's edge into it plus the blank node subtree as Turtle -- whole, not just
+      the chain down to `uri`, since the `sh:path`, `sh:message` etc. are what explain the
+      reference, except for list members (`sh:or` alternatives) that don't lead to `uri`.
+      Whole entries are added until `SEARCH_CBD_MAX_TRIPLES` is spent (the first always is);
+      `referenced_in_omitted` counts the rest.
 
     Blank nodes can't be named in SPARQL, so depth d is its own query chaining d blank nodes
     back to `uri` (blank node ids are stable across queries); the owner's subtree comes from
@@ -2140,25 +2258,27 @@ def _incoming(store: Store, uri: str, prefixes: dict[str, str], used: set[str]) 
             if not any(z.kind == "bnode" for *_, z in rows):
                 break
 
-    blocks: list[str] = []
+    entries: list[dict[str, Any]] = []
     spent = 0
     described: dict[str, list[_RdfTriple]] = {}
-    candidates: list[list[_RdfTriple] | tuple[str, Any, Any]] = [*sorted(owned, key=str), *orphans.values()]
-    for candidate in candidates:
-        if isinstance(candidate, tuple):
-            owner, p, root = candidate
+    candidates: list[tuple[Optional[str], Any, Any]] = [
+        *sorted(owned, key=str), *((None, None, root) for root in orphans)
+    ]
+    for owner, edge, root in candidates:
+        if owner is not None:
             if owner not in described:
                 described[owner] = _describe(store, owner)
-            block = [(URIRef(owner), p, root), *_bnode_subtree(described[owner], root)]
+            block = [(URIRef(owner), edge, root), *_bnode_subtree(described[owner], root)]
         else:
-            block = list(dict.fromkeys(candidate))
-        if blocks and spent + len(block) > SEARCH_CBD_MAX_TRIPLES:
+            block = list(dict.fromkeys(orphans[root]))
+        entry, size = _reference_entry(block, owner, edge, root, uri, prefixes, used)
+        if entries and spent + size > SEARCH_CBD_MAX_TRIPLES:
             break
-        blocks.append(_triples_turtle(block, prefixes, used))
-        spent += len(block)
-    result: dict[str, Any] = {"direct": direct, "blank_node_blocks": blocks}
-    if len(blocks) < len(candidates):
-        result["blank_node_blocks_omitted"] = len(candidates) - len(blocks)
+        entries.append(entry)
+        spent += size
+    result: dict[str, Any] = {"direct": direct, "referenced_in": entries}
+    if len(entries) < len(candidates):
+        result["referenced_in_omitted"] = len(candidates) - len(entries)
     return result
 
 
@@ -2225,11 +2345,15 @@ def search(
     `include_cbd_symmetric=True` adds the other half of the symmetric CBD, what points *at*
     each hit, as a separate `incoming` alongside `cbd`: `direct` maps each predicate to the
     named nodes using it on the hit (a class's subclasses and instances, `brick:feeds` from
-    upstream), at most 20 each then `"... and N more"`; `blank_node_blocks` is one Turtle
-    block per nested structure referencing the hit -- a SHACL shape's
-    `sh:property [ sh:path ...; sh:class X ]`, an OWL restriction -- shown whole, from its
-    named owner down, so its `sh:path` / `sh:message` say *why* it references the hit. Whole
-    blocks fill a 200-triple budget; `blank_node_blocks_omitted` counts any left out.
+    upstream), at most 20 each then `"... and N more"`; `referenced_in` has one entry per
+    nested structure referencing the hit -- a SHACL shape's
+    `sh:property [ sh:path ...; sh:class X ]`, an OWL restriction: its named `owner` (null if
+    none), `paths` from the owner down to the hit (e.g.
+    `sh:or[2] / sh:property / sh:qualifiedValueShape / sh:class`, `[i]` a list position), and
+    `turtle`, the structure shown whole so its `sh:path` / `sh:message` say *why* it references
+    the hit -- except list members (other `sh:or` alternatives) that don't lead to the hit,
+    which are dropped and noted in `pruned`. Whole entries fill a 200-triple budget;
+    `referenced_in_omitted` counts any left out.
     """
     index = _get_search_index(dataset)
     store = _datasets[dataset].store
