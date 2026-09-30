@@ -20,8 +20,10 @@ from sparql_relax_mcp.server import (
     _remove_inferred_superclass_types,
     _strip_ontology,
     _subclass_hierarchy,
+    TOOLSETS,
     build_server,
     mcp,
+    traverse,
 )
 
 # Uses the Brick namespace (rather than an arbitrary made-up one) because diagnose's
@@ -70,8 +72,12 @@ CORE_TOOLS = {"load_dataset", "list_datasets", "summarize_schema", "run_query"}
 async def test_default_server_is_extended_toolset():
     async with create_connected_server_and_client_session(mcp) as client:
         tools = (await client.list_tools()).tools
-        assert {t.name for t in tools} == CORE_TOOLS | {"search", "traverse"}
-    assert "use search" in mcp.instructions and "use traverse" in mcp.instructions
+        assert {t.name for t in tools} == CORE_TOOLS | {"search"}
+    assert "use search" in mcp.instructions and "traverse" not in mcp.instructions
+
+
+def test_traverse_is_deprecated_and_in_no_toolset():
+    assert all(traverse not in tools for tools in TOOLSETS.values())
 
 
 @pytest.mark.asyncio
@@ -361,7 +367,7 @@ async def test_run_query_reports_ok_and_returns_rows_on_a_working_query():
         assert result["row_count"] == 2
         assert result["culprits"] == []
         assert result["filter_issues"] == []
-        assert result["diagnosis_error"] is None
+        assert result["diagnosis_skipped"] is None
         # row_limit defaults to 3, so both of this query's rows come back.
         assert result["variables"] == ["s"]
         # URIs come back as CURIEs (prefix:local), not full URIs, using the ex: prefix
@@ -704,7 +710,7 @@ async def test_run_query_diagnoses_a_false_ask_and_an_empty_construct():
             result = _result_json(await client.call_tool("run_query", {"dataset": "b223", "query": query}))
             assert result["ok"] is False, query
             assert result["row_count"] == 0, query
-            assert result["diagnosis_error"] is None, query
+            assert result["diagnosis_skipped"] is None, query
             assert result["culprits"][0]["triples"][0]["triple"] == "ex:building223 ex:hasSensor ?sensor", query
             if result["form"] == "boolean":
                 assert result["result"] is False
@@ -731,14 +737,14 @@ async def test_run_query_executes_a_bare_describe_without_diagnosing():
 @pytest.mark.asyncio
 async def test_run_query_still_executes_a_query_it_cannot_diagnose():
     # An all-variable pattern has no BGP triples for the ablation search to work with --
-    # the diagnosis errors, but the caller still gets the query's results.
+    # the diagnosis is skipped, but the query ran fine, so that isn't reported as a failure.
     async with create_connected_server_and_client_session(mcp) as client:
         await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
         result = _result_json(
             await client.call_tool("run_query", {"dataset": "b223", "query": "SELECT * WHERE { ?s ?p ?o }", "row_limit": None})
         )
-        assert result["diagnosis_error"] is not None
-        assert result["ok"] is False
+        assert result["diagnosis_skipped"] is not None
+        assert result["ok"] is True
         assert result["row_count"] is None
         assert len(result["rows"]) == 4
 
@@ -794,15 +800,16 @@ async def _load_taxonomy(client) -> None:
     _result_json(await client.call_tool("load_dataset", {"name": "tax", "data": TAXONOMY_TTL}))
 
 
+def _traverse(**kwargs) -> dict:
+    # traverse is deprecated and registered in no toolset, so it's tested as a plain function.
+    return traverse(dataset="tax", **kwargs)
+
+
 @pytest.mark.asyncio
 async def test_traverse_multiple_inheritance_is_a_dag_not_duplicated_paths():
     async with create_connected_server_and_client_session(mcp) as client:
         await _load_taxonomy(client)
-        result = _result_json(
-            await client.call_tool(
-                "traverse", {"dataset": "tax", "start": "brick:SAT_Sensor", "predicates": ["rdfs:subClassOf"], "max_depth": 5}
-            )
-        )
+        result = _traverse(start="brick:SAT_Sensor", predicates=["rdfs:subClassOf"], max_depth=5)
         levels = {lvl["depth"]: {n["node"]: n["via"] for n in lvl["nodes"]} for lvl in result["levels"]}
         assert set(levels[1]) == {"brick:Air_Temperature_Sensor", "brick:Supply_Air_Sensor"}
         # Sensor is reached from both parents: listed once, with both edges.
@@ -819,12 +826,7 @@ async def test_traverse_multiple_inheritance_is_a_dag_not_duplicated_paths():
 async def test_traverse_incoming_walks_down_a_taxonomy():
     async with create_connected_server_and_client_session(mcp) as client:
         await _load_taxonomy(client)
-        result = _result_json(
-            await client.call_tool(
-                "traverse",
-                {"dataset": "tax", "start": "brick:Sensor", "direction": "incoming", "predicates": ["rdfs:subClassOf"], "max_depth": 1},
-            )
-        )
+        result = _traverse(start="brick:Sensor", direction="incoming", predicates=["rdfs:subClassOf"], max_depth=1)
         assert {n["node"] for n in result["levels"][1]["nodes"]} == {"brick:Air_Temperature_Sensor", "brick:Supply_Air_Sensor"}
         # SAT_Sensor is one level further down.
         assert result["more_beyond_max_depth"] is True
@@ -834,9 +836,7 @@ async def test_traverse_incoming_walks_down_a_taxonomy():
 async def test_traverse_terminates_on_cycles_and_records_the_back_edge():
     async with create_connected_server_and_client_session(mcp) as client:
         await _load_taxonomy(client)
-        result = _result_json(
-            await client.call_tool("traverse", {"dataset": "tax", "start": "ex:ahu1", "predicates": ["brick:feeds"], "max_depth": 10})
-        )
+        result = _traverse(start="ex:ahu1", predicates=["brick:feeds"], max_depth=10)
         assert result["node_count"] == 1
         assert result["levels"][0]["nodes"][0]["via"] == [["ex:vav1", "brick:feeds"]]
 
@@ -845,7 +845,7 @@ async def test_traverse_terminates_on_cycles_and_records_the_back_edge():
 async def test_traverse_all_predicates_literals_are_leaves_and_blank_nodes_skipped():
     async with create_connected_server_and_client_session(mcp) as client:
         await _load_taxonomy(client)
-        result = _result_json(await client.call_tool("traverse", {"dataset": "tax", "start": "ex:sat1", "max_depth": 2}))
+        result = _traverse(start="ex:sat1", max_depth=2)
         depth1 = {n["node"] for n in result["levels"][1]["nodes"]}
         assert depth1 == {"brick:SAT_Sensor", '"AHU-1 SAT"'}
         assert result["blank_node_edges_skipped"] == 1
@@ -857,11 +857,7 @@ async def test_traverse_all_predicates_literals_are_leaves_and_blank_nodes_skipp
 async def test_traverse_max_nodes_truncates():
     async with create_connected_server_and_client_session(mcp) as client:
         await _load_taxonomy(client)
-        result = _result_json(
-            await client.call_tool(
-                "traverse", {"dataset": "tax", "start": "brick:SAT_Sensor", "predicates": ["rdfs:subClassOf"], "max_nodes": 2}
-            )
-        )
+        result = _traverse(start="brick:SAT_Sensor", predicates=["rdfs:subClassOf"], max_nodes=2)
         assert result["node_count"] == 1
         assert result["truncated"] is True
 
@@ -870,8 +866,8 @@ async def test_traverse_max_nodes_truncates():
 async def test_traverse_rejects_unknown_prefix():
     async with create_connected_server_and_client_session(mcp) as client:
         await _load_taxonomy(client)
-        result = await client.call_tool("traverse", {"dataset": "tax", "start": "brik:Sensor"})
-        assert result.isError
+        with pytest.raises(ValueError):
+            _traverse(start="brik:Sensor")
 
 
 @pytest.mark.asyncio
@@ -932,3 +928,87 @@ async def test_search_index_is_rebuilt_when_a_dataset_is_replaced():
         await client.call_tool("load_dataset", {"name": "tax", "data": TTL})
         second = _result_json(await client.call_tool("search", {"dataset": "tax", "text": "rooftop"}))
         assert second["results"] == []
+
+
+@pytest.mark.asyncio
+async def test_search_include_predicates_lists_every_requested_predicate():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await _load_taxonomy(client)
+        result = _result_json(
+            await client.call_tool(
+                "search",
+                {"dataset": "tax", "text": "physical quantity", "limit": 1,
+                 "include_predicates": ["rdfs:comment", "rdfs:subClassOf", "rdfs:label"]},
+            )
+        )
+        hit = result["results"][0]
+        assert hit["uri"] == "brick:Sensor"
+        assert hit["properties"] == {
+            "rdfs:comment": ['"Measures a physical quantity"'],
+            "rdfs:subClassOf": ["brick:Point"],
+            "rdfs:label": [],
+        }
+        assert "cbd" not in hit
+
+        bnode = _result_json(
+            await client.call_tool(
+                "search", {"dataset": "tax", "text": "AHU-1", "mode": "regex", "include_predicates": ["brick:hasUnit"]}
+            )
+        )
+        assert bnode["results"][0]["properties"]["brick:hasUnit"][0].startswith("[] (blank node")
+
+
+@pytest.mark.asyncio
+async def test_search_include_cbd_follows_blank_nodes_as_turtle():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await _load_taxonomy(client)
+        result = _result_json(
+            await client.call_tool("search", {"dataset": "tax", "text": "AHU-1", "mode": "regex", "include_cbd": True})
+        )
+        hit = result["results"][0]
+        assert hit["uri"] == "ex:sat1"
+        assert "cbd_truncated" not in hit
+        # Prefix lines are stripped (the response's `prefixes` carries them); the blank node's
+        # own triples are nested inline.
+        assert "@prefix" not in hit["cbd"]
+        parsed = Graph().parse(
+            data="".join(f"@prefix {p}: <{ns}> .\n" for p, ns in result["prefixes"].items()) + hit["cbd"], format="turtle"
+        )
+        assert len(parsed) == 4  # type, bacnetName, hasUnit, and the unit's own rdfs:label
+        assert '"degF"' in hit["cbd"]
+
+
+@pytest.mark.asyncio
+async def test_search_rejects_unknown_prefix_in_include_predicates():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await _load_taxonomy(client)
+        result = await client.call_tool("search", {"dataset": "tax", "text": "sensor", "include_predicates": ["rdfz:label"]})
+        assert result.isError
+
+
+@pytest.mark.asyncio
+async def test_run_query_property_path_only_query_is_not_an_error():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await _load_taxonomy(client)
+        prefixes = "PREFIX brick: <https://brickschema.org/schema/Brick#> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> "
+        found = _result_json(
+            await client.call_tool(
+                "run_query",
+                {"dataset": "tax", "query": prefixes + "SELECT ?anc WHERE { brick:SAT_Sensor rdfs:subClassOf+ ?anc }", "row_limit": None},
+            )
+        )
+        assert found["ok"] is True
+        assert found["diagnosis_skipped"] is not None
+        assert {r["anc"]["value"] for r in found["rows"]} == {
+            "brick:Air_Temperature_Sensor", "brick:Supply_Air_Sensor", "brick:Sensor", "brick:Point",
+        }
+        assert "not a problem with the query" in found["message"]
+
+        empty = _result_json(
+            await client.call_tool(
+                "run_query", {"dataset": "tax", "query": prefixes + "SELECT ?anc WHERE { brick:Nope rdfs:subClassOf+ ?anc }"}
+            )
+        )
+        assert empty["ok"] is False
+        assert empty["rows"] == []
+        assert "returned no results" in empty["message"]
