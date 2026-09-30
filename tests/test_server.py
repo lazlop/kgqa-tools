@@ -978,35 +978,66 @@ async def test_search_include_cbd_follows_blank_nodes_as_turtle():
         assert '"degF"' in hit["cbd"]
 
 
+def _parse_turtle(prefixes: dict[str, str], text: str) -> Graph:
+    return Graph().parse(data="".join(f"@prefix {p}: <{ns}> .\n" for p, ns in prefixes.items()) + text, format="turtle")
+
+
+SHAPES_TTL = TAXONOMY_TTL + """
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+ex:Shape sh:property [ sh:path brick:hasPoint ; sh:message "needs a sensor" ;
+    sh:qualifiedValueShape [ sh:class brick:Sensor ] ; sh:qualifiedMinCount 1 ] .
+[] a owl:AllDisjointClasses ; owl:members ( brick:Point brick:Sensor ) .
+"""
+
+
 @pytest.mark.asyncio
-async def test_search_include_cbd_symmetric_adds_inbound_triples_through_blank_nodes():
-    shape_ttl = TAXONOMY_TTL + (
-        "@prefix sh: <http://www.w3.org/ns/shacl#> .\n"
-        "ex:Shape sh:property [ sh:qualifiedValueShape [ sh:class brick:Sensor ] ] .\n"
-    )
+async def test_search_include_cbd_symmetric_returns_incoming_separately():
     async with create_connected_server_and_client_session(mcp) as client:
-        _result_json(await client.call_tool("load_dataset", {"name": "tax", "data": shape_ttl}))
+        _result_json(await client.call_tool("load_dataset", {"name": "tax", "data": SHAPES_TTL}))
         args = {"dataset": "tax", "text": "^brick:Sensor$", "mode": "regex"}
         plain = _result_json(await client.call_tool("search", {**args, "include_cbd": True}))["results"][0]
         result = _result_json(await client.call_tool("search", {**args, "include_cbd_symmetric": True}))
         hit = result["results"][0]
-        assert hit["uri"] == "brick:Sensor"
-        assert "cbd_truncated" not in hit
-        parsed = Graph().parse(
-            data="".join(f"@prefix {p}: <{ns}> .\n" for p, ns in result["prefixes"].items()) + hit["cbd"], format="turtle"
-        )
-        # Outbound: subClassOf Point, comment. Inbound: the two subclasses, plus the shape
-        # followed back through both blank nodes to the named ex:Shape.
-        assert len(parsed) == 7
-        assert "ex:Shape" in hit["cbd"] and "brick:Supply_Air_Sensor" in hit["cbd"]
-        assert "ex:Shape" not in plain["cbd"]
+        # `cbd` stays outgoing-only; what points at the hit is in `incoming`.
+        assert hit["cbd"] == plain["cbd"] and "incoming" not in plain
+        incoming = hit["incoming"]
+        assert incoming["direct"] == {"rdfs:subClassOf": ["brick:Air_Temperature_Sensor", "brick:Supply_Air_Sensor"]}
+        assert "blank_node_blocks_omitted" not in incoming
+        shape, disjoint = sorted(incoming["blank_node_blocks"], key=lambda b: "owl:" in b)
+        # The whole shape, not just the chain down to brick:Sensor: its sh:path and message too.
+        assert len(_parse_turtle(result["prefixes"], shape)) == 6
+        assert "sh:path brick:hasPoint" in shape and '"needs a sensor"' in shape
+        # An unreferenced blank node is shown whole too -- the full member list and its type.
+        assert len(_parse_turtle(result["prefixes"], disjoint)) == 6
+        assert "owl:AllDisjointClasses" in disjoint and "brick:Point" in disjoint
 
-        # A class with more instances than the cap: the instances are what gets cut.
-        crowded = shape_ttl + "".join(f"ex:s{i} a brick:Sensor .\n" for i in range(300))
-        _result_json(await client.call_tool("load_dataset", {"name": "tax", "data": crowded}))
-        hit = _result_json(await client.call_tool("search", {**args, "include_cbd_symmetric": True}))["results"][0]
-        assert hit["cbd_truncated"] is True
-        assert "ex:Shape" in hit["cbd"] and "brick:Supply_Air_Sensor" in hit["cbd"]
+
+@pytest.mark.asyncio
+async def test_search_include_cbd_symmetric_caps_per_predicate_and_cuts_whole_blocks():
+    shapes = "".join(
+        f"ex:Shape{i} sh:property [ sh:path ex:p{i} ; sh:minCount 1 ; sh:class brick:Sensor ] .\n" for i in range(60)
+    )
+    instances = "".join(f"ex:s{i:03} a brick:Sensor .\n" for i in range(300))
+    async with create_connected_server_and_client_session(mcp) as client:
+        _result_json(await client.call_tool("load_dataset", {"name": "tax", "data": SHAPES_TTL + shapes + instances}))
+        result = _result_json(
+            await client.call_tool(
+                "search", {"dataset": "tax", "text": "^brick:Sensor$", "mode": "regex", "include_cbd_symmetric": True}
+            )
+        )
+        incoming = result["results"][0]["incoming"]
+        types = incoming["direct"]["rdf:type"]
+        assert types[:2] == ["ex:s000", "ex:s001"] and types[-1] == "... and 280 more" and len(types) == 21
+        assert len(incoming["direct"]["rdfs:subClassOf"]) == 2
+        # 62 blocks (60 four-triple shapes, ex:Shape's, the disjointness axiom) don't fit in
+        # 200 triples; every block returned is whole, and the rest are counted.
+        blocks = incoming["blank_node_blocks"]
+        assert len(blocks) + incoming["blank_node_blocks_omitted"] == 62
+        for block in blocks:
+            if "ex:p" in block:
+                assert len(_parse_turtle(result["prefixes"], block)) == 4
+        assert sum(len(_parse_turtle(result["prefixes"], b)) for b in blocks) <= 200
 
 
 @pytest.mark.asyncio
