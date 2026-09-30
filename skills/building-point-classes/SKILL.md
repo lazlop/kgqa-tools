@@ -65,7 +65,7 @@ For each group, look for an existing term before considering an extension:
    Try synonyms before concluding nothing exists. "Running/Stopped" finds nothing, but it is
    `s223:Binary-OnOff`. `references/s223.md` has a synonym table for common state texts.
 2. **Inspect the candidate.** With kgqa-tools, one call covers this step and the next:
-   `search(dataset, "^s223:Binary-OnOff$", mode="regex", include_cbd_symmetric=True)`.
+   `search(dataset, "^s223:Binary-OnOff$", mode="regex", include_cbd=True, include_cbd_incoming=True)`.
    - `cbd` gives the definition and parents.
    - `incoming.direct["rdfs:subClassOf"]` lists the children. For an enumeration kind, these
      are its members.
@@ -77,7 +77,7 @@ For each group, look for an existing term before considering an extension:
 3. **Check the constraints on it.** Shapes in extensions can require a specific term. G36's
    `g36:Zone`, for example, expects the window switch to use `s223:Binary-OnOff`. In the same
    search call, `incoming.referenced_in` lists every shape that references the term, with its
-   owner and path. Without kgqa-tools, use query 5. If a shape conflicts with the exact
+   owner and the shape itself. Without kgqa-tools, use query 5. If a shape conflicts with the exact
    semantics, that's a judgement call to report, not something to resolve silently.
 4. **For Brick, check deprecation (query 8).** Search returns deprecated classes too.
 

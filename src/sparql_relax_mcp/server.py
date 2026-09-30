@@ -84,8 +84,9 @@ _EXTENDED_INSTRUCTIONS = _CORE_INSTRUCTIONS + (
     "comments and other string literals) or by regex -- instead of guessing names and letting "
     "run_query catch the guess. To judge which hit is the right one, have search return more "
     "about each: include_predicates (e.g. ['rdfs:label', 'skos:definition', 'rdfs:subClassOf']) "
-    "for just those values, include_cbd=true for each hit's full concise bounded description, "
-    "or include_cbd_symmetric=true to also get what points at each hit, as a separate `incoming`."
+    "for just those values, include_cbd=true for what each hit says about itself (its concise "
+    "bounded description), and/or include_cbd_incoming=true for what points at each hit. With "
+    "either, limit defaults to 3 hits instead of 10."
 )
 
 
@@ -1995,17 +1996,22 @@ def _bm25_scores(index: _SearchIndex, text: str) -> dict[int, float]:
     return scores
 
 
+SEARCH_DEFAULT_LIMIT = 10
+SEARCH_CBD_DEFAULT_LIMIT = 3
+"""`search`'s `limit` when none is given, without and with `include_cbd`/`include_cbd_incoming`
+-- a keyword search over Brick or 223P returning a CBD per hit is ~4-5k tokens at 10 hits,
+~1-1.5k at 3."""
 SEARCH_CBD_MAX_TRIPLES = 200
 """Per-hit cap on the triples rendered for `include_cbd` -- a Brick or 223P class's CBD is
 usually a few dozen triples, but an instance hub (or a class carrying a large SHACL shape) can
 have far more, and `limit` hits each carry their own."""
 SEARCH_CBD_MAX_BNODE_DEPTH = 8
-"""How many blank nodes deep `include_cbd_symmetric` walks back from a hit to find the
+"""How many blank nodes deep `include_cbd_incoming` walks back from a hit to find the
 structure that references it -- one query per level, and real SHACL shapes / OWL
 restrictions / RDF lists rarely nest deeper."""
 SEARCH_MAX_PREDICATE_VALUES = 20
 """Per-hit, per-predicate cap on the values `include_predicates` returns, and on the subjects
-`include_cbd_symmetric` lists per incoming predicate."""
+`include_cbd_incoming` lists per incoming predicate."""
 
 _TURTLE_PREFIX_LINE_RE = re.compile(r"^@prefix (\S*): <([^>]*)> \.$", re.MULTILINE)
 
@@ -2074,19 +2080,13 @@ def _bnode_subtree(triples: list[_RdfTriple], root: Any) -> list[_RdfTriple]:
     return subtree
 
 
-SEARCH_MAX_REFERENCE_PATHS = 5
-"""Per-`referenced_in`-entry cap on the paths listed from its owner down to the hit."""
-
-
 def _reference_entry(
-    triples: list[_RdfTriple], owner: Optional[str], edge: Optional[Any], root: Any, hit: str,
-    prefixes: dict[str, str], used: set[str],
+    triples: list[_RdfTriple], owner: Optional[str], hit: str, prefixes: dict[str, str], used: set[str]
 ) -> tuple[dict[str, Any], int]:
-    """One `referenced_in` entry for the blank node structure at `root` (reached from `owner`
-    by `edge`; both None when nothing names it), whose triples are `triples`: its `paths`
-    down to `hit`, and its Turtle with the RDF list members that don't lead to `hit` pruned
-    (an `sh:or`'s other alternatives), each pruning noted in `pruned`. Returns the entry and
-    its triple count after pruning."""
+    """One `referenced_in` entry for a blank node structure referencing `hit`, hanging off
+    `owner` (None when nothing names it), whose triples are `triples`: its Turtle with the RDF
+    list members that don't lead to `hit` pruned (an `sh:or`'s other alternatives), each
+    pruning noted in `pruned`. Returns the entry and its triple count after pruning."""
     target = URIRef(hit)
     out: dict[Any, list[tuple[Any, Any]]] = {}
     list_parents: dict[Any, Any] = {}  # list head -> the predicate pointing at it
@@ -2123,33 +2123,6 @@ def _reference_entry(
     def curie(term: Any) -> str:
         return _display_curie(str(term), prefixes, used)
 
-    paths: list[list[str]] = []
-
-    def walk_edge(pred: Any, obj: Any, parts: list[str], seen: frozenset) -> None:
-        step = curie(pred)
-        lst = list_of(obj)
-        if lst is not None:
-            for i, member in enumerate(lst[0], 1):
-                if member == target:
-                    paths.append([*parts, f"{step}[{i}]"])
-                elif reaches(member):
-                    walk_node(member, [*parts, f"{step}[{i}]"], seen)
-        elif obj == target:
-            paths.append([*parts, step])
-        elif reaches(obj):
-            walk_node(obj, [*parts, step], seen)
-
-    def walk_node(node: Any, parts: list[str], seen: frozenset) -> None:
-        if node in seen:
-            return
-        for pred, obj in out.get(node, []):
-            walk_edge(pred, obj, parts, seen | {node})
-
-    if edge is not None:
-        walk_edge(edge, root, [], frozenset())
-    else:
-        walk_node(root, [], frozenset())
-
     # Prune: in each list leading to the hit, drop the blank node members that don't.
     kept_triples = list(triples)
     pruned: list[str] = []
@@ -2180,10 +2153,6 @@ def _reference_entry(
         )
 
     entry: dict[str, Any] = {"owner": curie(owner) if owner is not None else None}
-    shown = [" / ".join(parts) for parts in paths[:SEARCH_MAX_REFERENCE_PATHS]]
-    if len(paths) > len(shown):
-        shown.append(f"... and {len(paths) - len(shown)} more")
-    entry["paths"] = shown
     entry["turtle"] = _triples_turtle(kept_triples, prefixes, used)
     if pruned:
         entry["pruned"] = pruned
@@ -2199,8 +2168,7 @@ def _incoming(store: Store, uri: str, prefixes: dict[str, str], used: set[str]) 
       every instance in a building graph).
     - `referenced_in`: each structure that references `uri` from inside a blank node (a
       SHACL `sh:property [ ... sh:class X ]`, an OWL restriction), one entry per structure
-      (see `_reference_entry`): its named `owner`, the `paths` from there down to `uri`, and
-      the named owner's edge into it plus the blank node subtree as Turtle -- whole, not just
+      (see `_reference_entry`): its named `owner` and the named owner's edge into it plus the blank node subtree as Turtle -- whole, not just
       the chain down to `uri`, since the `sh:path`, `sh:message` etc. are what explain the
       reference, except for list members (`sh:or` alternatives) that don't lead to `uri`.
       Whole entries are added until `SEARCH_CBD_MAX_TRIPLES` is spent (the first always is);
@@ -2278,7 +2246,7 @@ def _incoming(store: Store, uri: str, prefixes: dict[str, str], used: set[str]) 
             block = [(URIRef(owner), edge, root), *_bnode_subtree(described[owner], root)]
         else:
             block = list(dict.fromkeys(orphans[root]))
-        entry, size = _reference_entry(block, owner, edge, root, uri, prefixes, used)
+        entry, size = _reference_entry(block, owner, uri, prefixes, used)
         if entries and spent + size > SEARCH_CBD_MAX_TRIPLES:
             break
         entries.append(entry)
@@ -2325,10 +2293,10 @@ def search(
     text: str,
     mode: Literal["bm25", "regex"] = "bm25",
     kind: Literal["any", "class", "predicate", "instance"] = "any",
-    limit: int = 10,
+    limit: Optional[int] = None,
     include_predicates: Optional[list[str]] = None,
     include_cbd: bool = False,
-    include_cbd_symmetric: bool = False,
+    include_cbd_incoming: bool = False,
 ) -> dict[str, Any]:
     """Find nodes in `dataset` by keyword or regex -- use it to get the URI for a concept
     before writing SPARQL against it.
@@ -2338,35 +2306,36 @@ def search(
     their string literals (labels, comments, definitions). `mode="regex"` matches a Python regex
     against each node's full URI, CURIE, and string literals (case-sensitive; prefix `(?i)` to
     ignore case); `total_matches` counts every regex match, not just the `limit` returned. `kind`
-    restricts results to classes, predicates, or instances.
+    restricts results to classes, predicates, or instances. `limit` defaults to 10 hits, or 3
+    with `include_cbd` / `include_cbd_incoming`, since each hit's CBD can be dozens of triples.
 
-    To tell candidates apart without a follow-up query, ask for more about each hit.
-    `include_predicates` (e.g. `["rdfs:label", "skos:definition", "rdfs:subClassOf"]`) adds a
-    `properties` map with each hit's values for just those predicates (every requested
-    predicate is listed, empty if the hit has none). `include_cbd=True` adds `cbd`: the hit's
-    concise bounded description -- every triple with it as subject, plus the same for any blank
-    node objects, recursively (so Brick `sh:rule` tag blocks and 223P property shapes are
-    included) -- as Turtle using this response's `prefixes`. A CBD is capped at 200 triples
-    (`cbd_truncated: true` when cut); lower `limit` when using it.
-
-    `include_cbd_symmetric=True` adds the other half of the symmetric CBD, what points *at*
-    each hit, as a separate `incoming` alongside `cbd`: `direct` maps each predicate to the
-    named nodes using it on the hit (a class's subclasses and instances, `brick:feeds` from
-    upstream), at most 20 each then `"... and N more"`; `referenced_in` has one entry per
-    nested structure referencing the hit -- a SHACL shape's
-    `sh:property [ sh:path ...; sh:class X ]`, an OWL restriction: its named `owner` (null if
-    none), `paths` from the owner down to the hit (e.g.
-    `sh:or[2] / sh:property / sh:qualifiedValueShape / sh:class`, `[i]` a list position), and
-    `turtle`, the structure shown whole so its `sh:path` / `sh:message` say *why* it references
-    the hit -- except list members (other `sh:or` alternatives) that don't lead to the hit,
-    which are dropped and noted in `pruned`. Whole entries fill a 200-triple budget;
-    `referenced_in_omitted` counts any left out.
+    To tell candidates apart without a follow-up query, ask for more about each hit (cheapest
+    first; combine freely):
+    - `include_predicates` (e.g. `["rdfs:label", "skos:definition", "rdfs:subClassOf"]`): a
+      `properties` map with just those values (every requested predicate is listed, empty if
+      the hit has none).
+    - `include_cbd=True`: `cbd`, what the hit says about itself -- every triple with it as
+      subject, plus blank node objects' triples, recursively (so Brick `sh:rule` tags and 223P
+      property shapes are included) -- as Turtle using this response's `prefixes`. Capped at
+      200 triples (`cbd_truncated: true` if cut).
+    - `include_cbd_incoming=True`: `incoming`, what points *at* the hit. `direct` maps each
+      predicate to the named nodes using it on the hit (subclasses, instances, `brick:feeds`
+      from upstream), at most 20 each then `"... and N more"`. `referenced_in` lists the nested
+      structures referencing it (a SHACL `sh:property [ sh:path ...; sh:class X ]`, an OWL
+      restriction), each with its named `owner` (null if none) and `turtle`, the structure
+      whole so its `sh:path` and `sh:message` say *why* it references the hit (list alternatives that don't
+      lead to the hit are dropped and noted in `pruned`); entries fill a 200-triple budget and
+      `referenced_in_omitted` counts the rest. Use it to find a class's subclasses or an
+      enumeration kind's members, and the shapes that constrain it. With `include_cbd` too,
+      the two together are the hit's symmetric CBD.
     """
     index = _get_search_index(dataset)
     store = _datasets[dataset].store
     # Copied: `_cbd_turtle` may add prefixes rdflib invented, which mustn't leak into the dataset.
     prefixes = dict(_datasets[dataset].prefixes)
     used_prefixes: set[str] = set()
+    if limit is None:
+        limit = SEARCH_CBD_DEFAULT_LIMIT if include_cbd or include_cbd_incoming else SEARCH_DEFAULT_LIMIT
     if limit < 1:
         raise ValueError("limit must be at least 1")
     predicate_uris = [_resolve_term(p, prefixes) for p in include_predicates] if include_predicates else []
@@ -2427,11 +2396,11 @@ def search(
             hit["matched_text"] = matched_text[idx]
         if predicate_uris:
             hit["properties"] = properties[entry.uri]
-        if include_cbd or include_cbd_symmetric:
+        if include_cbd:
             hit["cbd"], cbd_truncated = _cbd_turtle(store, entry.uri, prefixes, used_prefixes)
             if cbd_truncated:
                 hit["cbd_truncated"] = True
-        if include_cbd_symmetric:
+        if include_cbd_incoming:
             hit["incoming"] = _incoming(store, entry.uri, prefixes, used_prefixes)
         results.append(hit)
 
