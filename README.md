@@ -12,16 +12,13 @@ that need to understand and query a knowledge graph.
   file) into memory under `name`. Replaces any dataset already loaded under that name.
 - **`list_datasets()`** — list loaded datasets with their format and triple count.
 - **`summarize_schema(dataset, iterations=10, similarity_threshold=0.3,
-  include_member_counts=False, exclude_ontology=False)`** — summarize the dataset's structure into a compact
+  exclude_ontology=False)`** — summarize the dataset's structure into a compact
   `bs:`-namespaced class graph (via bschema), so an agent can see the graph's repeated patterns
   before writing any SPARQL against it. Call this **once** per dataset, right after
   `load_dataset`; the result is cached, so a repeat call is free but won't reflect changes until
   `load_dataset` reloads that name. `similarity_threshold` defaults to a lenient `0.3` (group
   subjects whose 1-hop patterns overlap by at least that much) rather than requiring an exact
-  match, since real graphs rarely have perfectly identical instance patterns. Pass
-  `include_member_counts=True` to also get `member_counts`, a mapping from each derived class's
-  CURIE to how many real instances it collapsed (e.g. `{"bs:VAV_version_1": 50}`) — off by default to keep
-  the common-case response small. Pass `exclude_ontology=True` when the dataset bundles its
+  match, since real graphs rarely have perfectly identical instance patterns. Pass `exclude_ontology=True` when the dataset bundles its
   ontology (Brick, 223P, ...) alongside the instance data: classes (`owl:Class`/`rdfs:Class`, or
   a metaclass subclassing one, like `s223:Class`), properties, SHACL shapes and ontology headers
   are dropped before summarizing, along with the blank nodes hanging off them (restrictions,
@@ -38,6 +35,13 @@ that need to understand and query a knowledge graph.
   type whose subclass link lives in an ontology that wasn't loaded stays. This part is left out of
   the tool's own description and response, so it doesn't distract the agent. The response adds
   `ontology_triples_removed`.
+
+  Called from Python (`sparql_relax_mcp.server.summarize_schema`), it also takes
+  `include_member_graph=False`: pass `True` to add `member_graph`, bschema's Turtle graph linking each
+  derived class to every real instance it collapsed (`bs:VAV_version_1 rdfs:member ex:vav1, ...`).
+  This is left out of the MCP tool. It's as long as the list of the data's subjects, and agents
+  turn on whatever optional flag they're shown: the tool used to have `include_member_counts`,
+  and in a benchmark run Gemma passed it on ~97% of calls without any sign it helped.
 
   What counts as "ontology" here rests on assumptions drawn from how Brick and 223P are defined:
   terms are typed as OWL/RDFS classes and properties or SHACL shapes (or with a metaclass, like

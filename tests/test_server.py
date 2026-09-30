@@ -9,7 +9,7 @@ import re
 
 import pytest
 from mcp.shared.memory import create_connected_server_and_client_session
-from rdflib import RDF, Graph, URIRef
+from rdflib import RDF, RDFS, Graph, URIRef
 from rdflib.compare import isomorphic
 
 from sparql_relax_mcp.server import (
@@ -23,6 +23,7 @@ from sparql_relax_mcp.server import (
     TOOLSETS,
     build_server,
     mcp,
+    summarize_schema,
     traverse,
 )
 
@@ -157,25 +158,27 @@ async def test_summarize_schema_returns_class_graph_and_caches():
 
 
 @pytest.mark.asyncio
-async def test_summarize_schema_member_counts_is_opt_in():
+async def test_summarize_schema_member_graph_is_python_only():
     async with create_connected_server_and_client_session(mcp) as client:
+        tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+        params = set(tools["summarize_schema"].inputSchema["properties"])
+        assert params == {"dataset", "iterations", "similarity_threshold", "exclude_ontology"}
+        assert "include_member_graph" not in tools["summarize_schema"].description
+
         await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
-
         without = _result_json(await client.call_tool("summarize_schema", {"dataset": "b223"}))
-        assert "member_counts" not in without
+        assert "member_graph" not in without
 
-        with_counts = _result_json(
-            await client.call_tool("summarize_schema", {"dataset": "b223", "include_member_counts": True})
-        )
-        # class_graph groups {building223, zone1} into one class and {sensor1, sensor2} into
-        # another (both 1-hop-identical pairs) -- member_counts should report 2 members each.
-        assert with_counts["member_counts"] == {c: 2 for c in with_counts["member_counts"]}
-        assert len(with_counts["member_counts"]) == 2
-        assert all(curie.startswith("bs:") for curie in with_counts["member_counts"])
-
-        # The flag only adds a field -- it doesn't change anything else about the summary.
-        assert with_counts["class_graph"] == without["class_graph"]
-        assert with_counts["compression_pct"] == without["compression_pct"]
+    # Called from Python, the flag adds the member graph and changes nothing else. class_graph
+    # groups {building223, zone1} into one class and {sensor1, sensor2} into another (both
+    # 1-hop-identical pairs), so each class should have 2 members.
+    with_members = summarize_schema("b223", include_member_graph=True)
+    assert "bs:" in with_members["member_graph"]
+    members = Graph().parse(data=with_members["member_graph"], format="turtle")
+    classes = set(members.subjects(RDFS.member, None, unique=True))
+    assert len(classes) == 2
+    assert all(len(list(members.objects(cls, RDFS.member))) == 2 for cls in classes)
+    assert {k: v for k, v in with_members.items() if k != "member_graph"} == without
 
 
 ONTOLOGY_DATA_TTL = """

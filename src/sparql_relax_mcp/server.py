@@ -996,8 +996,8 @@ def summarize_schema(
     dataset: str,
     iterations: int = 10,
     similarity_threshold: Optional[float] = 0.3,
-    include_member_counts: bool = False,
     exclude_ontology: bool = False,
+    include_member_graph: bool = False,
 ) -> dict[str, Any]:
     """Summarize `dataset`'s structure into a compact class graph (via bschema), so you can see
     its repeated patterns before writing SPARQL against it.
@@ -1024,14 +1024,6 @@ def summarize_schema(
     graph's repeated structure than exact isomorphism would. Pass `None` to require an exact
     match instead (more classes, each more homogeneous), or a higher ratio for something in
     between.
-
-    `include_member_counts` (default `False`) adds a `member_counts` field: a mapping from each
-    derived class's CURIE (as it appears in `class_graph`) to how many real instances it
-    collapsed, e.g. `{"bs:VAV_version_1": 50, "bs:AHU_version_1": 4}` -- lets you tell how many
-    of a given pattern actually exist (4 AHUs? 51 zones?) without spending a separate
-    `run_query` round trip on a `COUNT` query just to find out. Off by default to keep the
-    common-case response small; pass `True` when that count matters for what you're about to
-    query.
 
     `exclude_ontology` (default `False`) drops ontology definitions -- every class
     (`owl:Class`/`rdfs:Class`, or a metaclass declared as a subclass of one, like `s223:Class`),
@@ -1072,40 +1064,18 @@ def summarize_schema(
         class_graph, member_graph, iterations_run = create_bschema(
             data_graph, iterations=iterations, similarity_threshold=similarity_threshold, use_original_names=False
         )
-        # bschema_rs already binds its own broad default prefix list (rdf, s223, sh, ...) on
-        # class_graph -- fill in whatever's left (dataset-specific namespaces like a data file's
-        # own `ex1:`) from this dataset's own declared prefixes, without clobbering bschema_rs's
-        # picks for namespaces it already recognized. Only skip a prefix whose *namespace* is
-        # already bound -- if the *name* merely collides with a different namespace (e.g.
-        # bschema_rs's default `brick:` is an unversioned URI, but the dataset declares a
-        # versioned one), still bind it: rdflib's own `bind()` auto-suffixes the new prefix
-        # (`brick1:`) in that case rather than silently dropping it, so the dataset's real
-        # vocabulary never falls through to a serialize-time `nsN:`.
-        existing_namespaces = {str(ns) for _, ns in class_graph.namespaces()}
-        for prefix, ns in _extract_declared_prefixes(ds.data).items():
-            if ns in existing_namespaces:
-                continue
-            class_graph.bind(prefix, ns)
+        _bind_declared_prefixes(class_graph, ds.data)
         class_graph_text = class_graph.serialize(format="turtle")
         original_size = len(data_graph)
         compression_pct = (len(class_graph) / original_size * 100) if original_size else 0.0
-
-        # member_graph maps each derived class to every real instance it collapsed via
-        # rdfs:member triples -- create_bschema computes it regardless of include_member_counts,
-        # so counting it here costs a groupby, not a new graph traversal. Always compute and
-        # cache it (keyed by prefixes matching class_graph's own, post-fill) so a later call with
-        # include_member_counts=True doesn't need a second bschema run.
-        prefixes = {**DEFAULT_PREFIXES, **_extract_declared_prefixes(ds.data)}
-        member_counts = {
-            _uri_to_curie(str(cls), prefixes)[0]: sum(1 for _ in member_graph.objects(cls, RDFS.member))
-            for cls in sorted(member_graph.subjects(RDFS.member, None, unique=True))
-        }
 
         cached = {
             "class_graph": class_graph_text,
             "compression_pct": round(compression_pct, 2),
             "iterations_run": iterations_run,
-            "member_counts": member_counts,
+            # create_bschema builds this on every run anyway; kept (unserialized) so a later
+            # include_member_graph=True call doesn't need a second bschema run.
+            "member_graph": member_graph,
             "original_size": original_size,
             "class_graph_size": len(class_graph),
             "ontology_triples_removed": ontology_triples_removed,
@@ -1128,11 +1098,48 @@ def summarize_schema(
             f" Removed {cached['ontology_triples_removed']} ontology triple(s) (class, property and "
             "SHACL shape definitions) before summarizing; the triple counts above exclude them."
         )
-    if include_member_counts:
-        result["member_counts"] = cached["member_counts"]
-        message += " member_counts has each class's real instance count."
+    if include_member_graph:
+        if "member_graph_text" not in cached:
+            _bind_declared_prefixes(cached["member_graph"], _datasets[dataset].data)
+            cached["member_graph_text"] = cached["member_graph"].serialize(format="turtle")
+        result["member_graph"] = cached["member_graph_text"]
     result["message"] = message
     return result
+
+
+def _bind_declared_prefixes(graph: Graph, data: str) -> None:
+    """Bind `data`'s declared prefixes on a bschema output graph for serializing.
+
+    bschema_rs already binds its own broad default prefix list (rdf, s223, sh, ...) -- this fills
+    in whatever's left (dataset-specific namespaces like a data file's own `ex1:`) without
+    clobbering bschema_rs's picks for namespaces it already recognized. Only a prefix whose
+    *namespace* is already bound is skipped -- if the *name* merely collides with a different
+    namespace (e.g. bschema_rs's default `brick:` is an unversioned URI, but the dataset declares a
+    versioned one), it's still bound: rdflib's own `bind()` auto-suffixes the new prefix
+    (`brick1:`) in that case rather than silently dropping it, so the dataset's real vocabulary
+    never falls through to a serialize-time `nsN:`.
+    """
+    existing_namespaces = {str(ns) for _, ns in graph.namespaces()}
+    for prefix, ns in _extract_declared_prefixes(data).items():
+        if ns not in existing_namespaces:
+            graph.bind(prefix, ns)
+
+
+# `include_member_graph` is Python-only: the member graph lists every real instance, which is
+# too much text for an agent (and agents turn on whatever optional flag they're shown -- see the
+# README). FastMCP builds a tool's input schema from its function's signature, so the MCP tool is
+# this wrapper, which leaves the flag out, registered under summarize_schema's name and docstring.
+def _summarize_schema_tool(
+    dataset: str,
+    iterations: int = 10,
+    similarity_threshold: Optional[float] = 0.3,
+    exclude_ontology: bool = False,
+) -> dict[str, Any]:
+    return summarize_schema(dataset, iterations, similarity_threshold, exclude_ontology)
+
+
+_summarize_schema_tool.__name__ = _summarize_schema_tool.__qualname__ = "summarize_schema"
+_summarize_schema_tool.__doc__ = summarize_schema.__doc__
 
 
 _IRIREF_RE = re.compile(r'<[^<>"{}|^`\\\x00-\x20]*>')
@@ -2454,8 +2461,8 @@ def search(
 # tools it doesn't have. `traverse` is deliberately in no toolset (deprecated).
 
 TOOLSETS: dict[str, tuple[Callable[..., Any], ...]] = {
-    "core": (load_dataset, list_datasets, summarize_schema, run_query),
-    "extended": (load_dataset, list_datasets, summarize_schema, run_query, search),
+    "core": (load_dataset, list_datasets, _summarize_schema_tool, run_query),
+    "extended": (load_dataset, list_datasets, _summarize_schema_tool, run_query, search),
 }
 _TOOLSET_INSTRUCTIONS = {"core": _CORE_INSTRUCTIONS, "extended": _EXTENDED_INSTRUCTIONS}
 DEFAULT_TOOLSET = "extended"
