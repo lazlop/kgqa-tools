@@ -21,11 +21,15 @@ reruns, reporting the result in that culprit's `suggested_fixes` only once verif
 actually return rows. See `_suggest_fixes_for_culprit`. This is unrelated to and much
 cheaper than `connect`, and runs regardless of it.
 
-The default `extended` toolset (see TOOLSETS) adds two exploration tools on top of
+The default `extended` toolset (see TOOLSETS) adds one exploration tool on top of
 those four: `search` (BM25 or regex over node names and string literals, for finding a
-URI before querying it) and `traverse` (a breadth-first walk from a node along chosen
-predicates, returned as a per-level DAG). `--toolset core` exposes only the original
-four, for when the extra tool descriptions aren't worth their context cost.
+URI before querying it, optionally with each hit's CBD or chosen predicates' values).
+`--toolset core` exposes only the original four, for when the extra tool description
+isn't worth its context cost.
+
+`traverse` (a breadth-first walk from a node along chosen predicates) is deprecated:
+the function is kept below but no toolset registers it -- see the README's
+"Deprecated: traverse" section for why.
 
 Every URI any tool returns is abbreviated to `prefix:local` (e.g. `s223:Zone`) rather
 than a full URI, using the dataset's own declared prefixes plus common defaults --
@@ -48,6 +52,7 @@ from typing import Any, Callable, Literal, Optional
 from bschema_rs import create_bschema
 from mcp.server.fastmcp import FastMCP
 from rdflib import BNode, Graph, URIRef
+from rdflib import Literal as RDFLiteral
 from rdflib.namespace import OWL, RDF, RDFS, SH
 from sparql_relax import QueryResult, Store, Term
 
@@ -77,10 +82,9 @@ _EXTENDED_INSTRUCTIONS = _CORE_INSTRUCTIONS + (
     " When you don't yet know the URI for a concept (a class, a predicate, or a specific "
     "instance), use search to find it -- by keyword (mode='bm25', over local names, labels, "
     "comments and other string literals) or by regex -- instead of guessing names and letting "
-    "run_query catch the guess. To walk a hierarchy or a chain of relations (up or down an "
-    "rdfs:subClassOf taxonomy, downstream along brick:feeds, ...), use traverse with a direction "
-    "and a predicate list; it returns the reachable structure level by level, with every edge "
-    "into each node, which a SPARQL property path's flat result doesn't show."
+    "run_query catch the guess. To judge which hit is the right one, have search return more "
+    "about each: include_predicates (e.g. ['rdfs:label', 'skos:definition', 'rdfs:subClassOf']) "
+    "for just those values, or include_cbd=true for each hit's full concise bounded description."
 )
 
 
@@ -1246,8 +1250,10 @@ def run_query(
     way an empty SELECT is), then the original query itself is executed for `result`/`triples`.
     A bare `DESCRIBE <uri>` with no WHERE clause has nothing to diagnose and is just executed
     (`row_count: null`). If the diagnosis itself can't run -- e.g. the pattern is only
-    all-variable triples like `?s ?p ?o`, which there's nothing to ablate in -- the query is still
-    executed and the reason is reported in `diagnosis_error`.
+    all-variable triples like `?s ?p ?o`, or only property paths like
+    `?c rdfs:subClassOf+ brick:Point`, which there's nothing to ablate in -- the query is still
+    executed, the reason is reported in `diagnosis_skipped`, and that isn't treated as an error:
+    `ok` is then just whether the query returned anything.
 
     On a query whose pattern matches nothing, or fewer rows than expected, `culprits`/
     `filter_issues` explain *why* -- which BGP triple(s) or FILTER(s) are responsible. Once the
@@ -1328,7 +1334,7 @@ def run_query(
 
     worker = _get_diagnose_worker()
     report = None
-    diagnosis_error: Optional[str] = None
+    diagnosis_skipped: Optional[str] = None
     culprits: list[dict[str, Any]] = []
     filter_issues: list[dict[str, Any]] = []
     cartesian_risks: list[Any] = []
@@ -1350,7 +1356,7 @@ def run_query(
                     expand_nonempty_results=False,
                 )
         except RuntimeError as exc:
-            diagnosis_error = str(exc)
+            diagnosis_skipped = str(exc)
 
     if report is not None and connect:
         culprits = [
@@ -1438,11 +1444,23 @@ def run_query(
     fixed_culprit_count = sum(1 for c in culprits if c["suggested_fixes"])
 
     if report is None:
-        ok = diagnosis_error is None
-        if diagnosed_query is None:
-            message = "Query executed; it has no WHERE pattern to diagnose."
+        # Nothing to diagnose (or the diagnosis couldn't run), but the query itself ran fine --
+        # that's not an error, so `ok` just reflects whether it returned anything, the same
+        # thing it means for a diagnosed query with no culprits.
+        if result["form"] == "boolean":
+            ok = bool(result["result"])
         else:
-            message = f"Query executed, but couldn't be diagnosed ({diagnosis_error}) -- check its results yourself."
+            ok = bool(result.get("rows") or result.get("triples"))
+        outcome = "returned results" if ok else "returned no results"
+        if diagnosed_query is None:
+            message = f"Query executed and {outcome}; it has no WHERE pattern to diagnose."
+        else:
+            message = f"Query executed and {outcome}. It wasn't diagnosed ({diagnosis_skipped})"
+            message += (
+                " -- that's a limit of the diagnosis, not a problem with the query."
+                if ok
+                else ", so there's no culprit analysis of why it returned nothing."
+            )
     else:
         ok = report.original_row_count > 0 and not culprits and not filter_issues
         if ok:
@@ -1486,7 +1504,7 @@ def run_query(
         "culprits": culprits,
         "filter_issues": filter_issues,
         "cartesian_risks_skipped": cartesian_risks_skipped,
-        "diagnosis_error": diagnosis_error,
+        "diagnosis_skipped": diagnosis_skipped,
         "prefixes": {p: prefixes[p] for p in sorted(used_prefixes)},
         "message": message,
     }
@@ -1600,8 +1618,12 @@ def _literal_display(term: Term, prefixes: dict[str, str], used: set[str]) -> st
 
 
 # ==============================================================================
-#  TRAVERSE
+#  TRAVERSE (deprecated)
 # ==============================================================================
+#
+# Deprecated: no toolset registers `traverse` any more, so no MCP client sees it. It's
+# kept as a plain function (and still tested) in case a redesigned version reuses it;
+# the README's "Deprecated: traverse" section has the benchmark evidence for pulling it.
 #
 # SPARQL property paths (`?x rdfs:subClassOf* ?y`, `?a brick:feeds+ ?b`) answer
 # "what's reachable", but flatten it into pairs: no depth, no record of which edge
@@ -1640,6 +1662,8 @@ def traverse(
     max_nodes: int = 100,
 ) -> dict[str, Any]:
     """Walk the graph breadth-first from `start` and return what's reachable, level by level.
+
+    Deprecated and not exposed as an MCP tool (see the TRAVERSE section comment above).
 
     `direction="outgoing"` follows `start pred ?next` edges; `"incoming"` follows `?next pred
     start`. `predicates` (e.g. `["rdfs:subClassOf"]`, `["brick:feeds"]`) restricts which edges are
@@ -1918,12 +1942,88 @@ def _bm25_scores(index: _SearchIndex, text: str) -> dict[int, float]:
     return scores
 
 
+SEARCH_CBD_MAX_TRIPLES = 200
+"""Per-hit cap on the triples rendered for `include_cbd` -- a Brick or 223P class's CBD is
+usually a few dozen triples, but an instance hub (or a class carrying a large SHACL shape) can
+have far more, and `limit` hits each carry their own."""
+SEARCH_MAX_PREDICATE_VALUES = 20
+"""Per-hit, per-predicate cap on the values `include_predicates` returns."""
+
+_TURTLE_PREFIX_LINE_RE = re.compile(r"^@prefix (\S*): <([^>]*)> \.$", re.MULTILINE)
+
+
+def _term_to_rdflib(term: Term) -> Any:
+    if term.kind == "uri":
+        return URIRef(term.value)
+    if term.kind == "bnode":
+        return BNode(term.value)
+    if term.language:
+        return RDFLiteral(term.value, lang=term.language)
+    datatype = None if term.datatype in (None, XSD_STRING_URI) else URIRef(term.datatype)
+    return RDFLiteral(term.value, datatype=datatype)
+
+
+def _cbd_turtle(store: Store, uri: str, prefixes: dict[str, str], used: set[str]) -> tuple[str, bool]:
+    """`uri`'s concise bounded description -- what the store's `DESCRIBE` returns: every
+    triple with `uri` as subject, plus the same recursively for any blank node objects -- as
+    Turtle with its `@prefix` lines stripped (the response's `prefixes` carries them instead,
+    same as every other tool). Blank nodes referenced once nest inline as `[ ... ]`. Returns
+    the text and whether `SEARCH_CBD_MAX_TRIPLES` cut it short."""
+    triples = store.query(f"DESCRIBE <{uri}>").triples or []
+    truncated = len(triples) > SEARCH_CBD_MAX_TRIPLES
+    graph = Graph(bind_namespaces="none")
+    for prefix, namespace in prefixes.items():
+        graph.bind(prefix, namespace, override=True, replace=True)
+    for s, p, o in triples[:SEARCH_CBD_MAX_TRIPLES]:
+        graph.add((_term_to_rdflib(s), _term_to_rdflib(p), _term_to_rdflib(o)))
+    text = graph.serialize(format="turtle")
+    # rdflib only emits the bindings it actually used; any it had to invent itself (`ns1:`)
+    # get added to `prefixes` so the stripped text still resolves.
+    for prefix, namespace in _TURTLE_PREFIX_LINE_RE.findall(text):
+        prefixes.setdefault(prefix, namespace)
+        used.add(prefix)
+    return _TURTLE_PREFIX_LINE_RE.sub("", text).strip(), truncated
+
+
+def _predicate_values(
+    store: Store, uris: list[str], predicate_uris: list[str], prefixes: dict[str, str], used: set[str]
+) -> dict[str, dict[str, list[str]]]:
+    """For each subject in `uris`, its values for each of `predicate_uris` (one query for all
+    of them), keyed by subject URI and then by predicate CURIE. Every requested predicate gets
+    a key even with no values, so "has none" is explicit rather than a missing key."""
+    pred_keys = {u: _display_curie(u, prefixes, used) for u in predicate_uris}
+    values: dict[str, dict[str, list[str]]] = {u: {key: [] for key in pred_keys.values()} for u in uris}
+    if not uris:
+        return values
+    query = (
+        f"SELECT ?s ?p ?o WHERE {{ VALUES ?s {{ {' '.join(f'<{u}>' for u in uris)} }} "
+        f"VALUES ?p {{ {' '.join(f'<{u}>' for u in predicate_uris)} }} ?s ?p ?o . }} ORDER BY ?s ?p ?o"
+    )
+    overflow: Counter = Counter()
+    for s, p, o in store.query(query).rows:
+        bucket = values[s.value][pred_keys[p.value]]
+        if len(bucket) >= SEARCH_MAX_PREDICATE_VALUES:
+            overflow[(s.value, p.value)] += 1
+            continue
+        if o.kind == "literal":
+            bucket.append(_literal_display(o, prefixes, used))
+        elif o.kind == "bnode":
+            bucket.append("[] (blank node -- use include_cbd to see inside it)")
+        else:
+            bucket.append(_display_curie(o.value, prefixes, used))
+    for (s, p), extra in overflow.items():
+        values[s][pred_keys[p]].append(f"... and {extra} more")
+    return values
+
+
 def search(
     dataset: str,
     text: str,
     mode: Literal["bm25", "regex"] = "bm25",
     kind: Literal["any", "class", "predicate", "instance"] = "any",
     limit: int = 10,
+    include_predicates: Optional[list[str]] = None,
+    include_cbd: bool = False,
 ) -> dict[str, Any]:
     """Find nodes in `dataset` by keyword or regex -- use it to get the URI for a concept
     before writing SPARQL against it.
@@ -1933,14 +2033,25 @@ def search(
     their string literals (labels, comments, definitions). `mode="regex"` matches a Python regex
     against each node's full URI, CURIE, and string literals (case-sensitive; prefix `(?i)` to
     ignore case); `total_matches` counts every regex match, not just the `limit` returned. `kind`
-    restricts results to classes, predicates, or instances. Follow up with `traverse` to explore
-    a hit.
+    restricts results to classes, predicates, or instances.
+
+    To tell candidates apart without a follow-up query, ask for more about each hit.
+    `include_predicates` (e.g. `["rdfs:label", "skos:definition", "rdfs:subClassOf"]`) adds a
+    `properties` map with each hit's values for just those predicates (every requested
+    predicate is listed, empty if the hit has none). `include_cbd=True` adds `cbd`: the hit's
+    concise bounded description -- every triple with it as subject, plus the same for any blank
+    node objects, recursively (so Brick `sh:rule` tag blocks and 223P property shapes are
+    included) -- as Turtle using this response's `prefixes`. A CBD is capped at
+    200 triples (`cbd_truncated: true` when cut); lower `limit` when using it.
     """
     index = _get_search_index(dataset)
-    prefixes = _datasets[dataset].prefixes
+    store = _datasets[dataset].store
+    # Copied: `_cbd_turtle` may add prefixes rdflib invented, which mustn't leak into the dataset.
+    prefixes = dict(_datasets[dataset].prefixes)
     used_prefixes: set[str] = set()
     if limit < 1:
         raise ValueError("limit must be at least 1")
+    predicate_uris = [_resolve_term(p, prefixes) for p in include_predicates] if include_predicates else []
 
     def _keep(entry: _SearchEntry) -> bool:
         return kind == "any" or kind in entry.kinds
@@ -1976,8 +2087,14 @@ def search(
     else:
         raise ValueError("mode must be 'bm25' or 'regex'")
 
+    shown = ranked[:limit]
+    properties = (
+        _predicate_values(store, [index.entries[idx].uri for idx in shown], predicate_uris, prefixes, used_prefixes)
+        if predicate_uris
+        else {}
+    )
     results = []
-    for idx in ranked[:limit]:
+    for idx in shown:
         entry = index.entries[idx]
         hit: dict[str, Any] = {
             "uri": _display_curie(entry.uri, prefixes, used_prefixes),
@@ -1990,6 +2107,12 @@ def search(
             hit["score"] = round(scores[idx], 3)
         elif idx in matched_text:
             hit["matched_text"] = matched_text[idx]
+        if predicate_uris:
+            hit["properties"] = properties[entry.uri]
+        if include_cbd:
+            hit["cbd"], cbd_truncated = _cbd_turtle(store, entry.uri, prefixes, used_prefixes)
+            if cbd_truncated:
+                hit["cbd_truncated"] = True
         results.append(hit)
 
     response: dict[str, Any] = {"results": results}
@@ -2013,13 +2136,13 @@ def search(
 #
 # Every tool's description is sent to the agent on every turn, so each tool costs
 # context whether or not it's used. The toolset picks which tools get registered:
-# `core` is the original four; `extended` (the default) adds `search` and
-# `traverse`. The server-level instructions change with it, so a `core` agent is
-# never told about tools it doesn't have.
+# `core` is the original four; `extended` (the default) adds `search`. The
+# server-level instructions change with it, so a `core` agent is never told about
+# tools it doesn't have. `traverse` is deliberately in no toolset (deprecated).
 
 TOOLSETS: dict[str, tuple[Callable[..., Any], ...]] = {
     "core": (load_dataset, list_datasets, summarize_schema, run_query),
-    "extended": (load_dataset, list_datasets, summarize_schema, run_query, search, traverse),
+    "extended": (load_dataset, list_datasets, summarize_schema, run_query, search),
 }
 _TOOLSET_INSTRUCTIONS = {"core": _CORE_INSTRUCTIONS, "extended": _EXTENDED_INSTRUCTIONS}
 DEFAULT_TOOLSET = "extended"
@@ -2048,7 +2171,7 @@ def _parse_toolset(argv: Optional[list[str]] = None) -> str:
         choices=sorted(TOOLSETS),
         default=None,
         help=f"which tools to expose (default: ${TOOLSET_ENV_VAR} if set, else {DEFAULT_TOOLSET!r}). "
-        "'core' is load_dataset/list_datasets/summarize_schema/run_query; 'extended' adds search and traverse.",
+        "'core' is load_dataset/list_datasets/summarize_schema/run_query; 'extended' adds search.",
     )
     args = parser.parse_args(argv)
     toolset = args.toolset or os.environ.get(TOOLSET_ENV_VAR) or DEFAULT_TOOLSET
