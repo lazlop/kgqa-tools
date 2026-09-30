@@ -58,8 +58,10 @@ that need to understand and query a knowledge graph.
   is diagnosed as `SELECT * WHERE { ... }` first — so a `false` ASK or an empty CONSTRUCT is
   explained exactly like an empty SELECT — and then the original query is executed; a bare
   `DESCRIBE <uri>` with no WHERE clause is just executed. If the diagnosis itself can't run (e.g.
-  a pattern of only all-variable triples like `?s ?p ?o`), the query still runs and the reason
-  is reported in `diagnosis_error`. For each broken triple, `suggest_fixes` (on by default,
+  a pattern of only all-variable triples like `?s ?p ?o`, or only property paths like
+  `?c rdfs:subClassOf+ brick:Point`), the query still runs, the reason is reported in
+  `diagnosis_skipped`, and it isn't treated as an error — `ok` is then just whether the query
+  returned anything. For each broken triple, `suggest_fixes` (on by default,
   cheap) looks for the single most common cause — the query used the right local name under the
   wrong namespace, or the right namespace with a mis-cased local name — and reports it in that
   culprit's `suggested_fixes` only after actually substituting it in and confirming the rerun
@@ -73,10 +75,11 @@ that need to understand and query a knowledge graph.
   pathologically stuck query is hard-killed after 30s and the worker is automatically restarted —
   you'll see this as an error naming the timeout, not a silent hang.
 
-The default `extended` toolset (see [Choosing a toolset](#choosing-a-toolset)) adds two tools for
+The default `extended` toolset (see [Choosing a toolset](#choosing-a-toolset)) adds one tool for
 exploring a graph before or between queries:
 
-- **`search(dataset, text, mode="bm25", kind="any", limit=10)`** — find the URI for a concept
+- **`search(dataset, text, mode="bm25", kind="any", limit=10, include_predicates=None,
+  include_cbd=False)`** — find the URI for a concept
   instead of guessing it. `mode="bm25"` ranks nodes by keyword relevance over their local names
   (split into words, so `supply air temp` matches `Supply_Air_Temperature_Sensor` and `has point`
   matches `hasPoint`), their `rdf:type`s' names, and their string literals (labels, comments,
@@ -87,14 +90,15 @@ exploring a graph before or between queries:
   searchable as what's loaded: a data graph that references `brick:` classes without including
   the Brick ontology has no definitions or hierarchy for them, so load the ontology into the
   same dataset when that matters.
-- **`traverse(dataset, start, direction="outgoing", predicates=None, max_depth=3,
-  max_nodes=100)`** — breadth-first walk from `start`, returned level by level. Each node appears
-  once, at the depth where it was first reached, and `via` lists every `[previous_node, predicate]` edge into it, so
-  multiple inheritance shows up as several `via` entries instead of duplicated paths, and cycles
-  (e.g. `brick:feeds` loops) end on their own. `predicates` limits which edges are followed
-  (omit it to follow all of them); for a taxonomy, outgoing `rdfs:subClassOf` walks up and
-  incoming walks down. Literals are leaves and blank nodes are skipped. `truncated` and
-  `more_beyond_max_depth` report when there's more than was returned.
+
+  Two options return more about each hit, for telling candidates apart without a follow-up query.
+  `include_predicates` (e.g. `["rdfs:label", "skos:definition", "rdfs:subClassOf"]`) adds a
+  `properties` map with each hit's values for just those predicates. `include_cbd=True` adds a
+  `cbd`: the hit's [concise bounded description](https://www.w3.org/submission/CBD/) — every
+  triple with it as subject, plus the same recursively for any blank node objects (so Brick's
+  `sh:rule` tag blocks and 223P's property shapes are included) — as Turtle, using the
+  response's `prefixes`. A CBD is capped at 200 triples (`cbd_truncated` says when that cut it
+  short); lower `limit` when using it, since a Brick or 223P class's CBD can be dozens of triples.
 
 **Intended workflow:** `load_dataset`, then `summarize_schema` once to understand the graph's
 shape. From there, `run_query` for every query — it's nearly free when the query works, tells you
@@ -316,7 +320,7 @@ or pointed at a local clone instead:
 Every tool's description is sent to the agent on every turn, so each tool costs context. The
 server exposes one of two toolsets:
 
-- **`extended`** (default): all six tools — the core four plus `search` and `traverse`.
+- **`extended`** (default): all five tools — the core four plus `search`.
 - **`core`**: just `load_dataset`, `list_datasets`, `summarize_schema` and `run_query`.
 
 Pick one with `--toolset` after the command, or with the `SPARQL_RELAX_TOOLSET` environment
@@ -368,3 +372,39 @@ client.
 `sparql-relax-rs` is pulled from [`lazlop/sparql-relax`](https://github.com/lazlop/sparql-relax)
 (see `[tool.uv.sources]` in `pyproject.toml`) rather than a local path, so changes to the Rust
 core there need to land upstream before `uv sync` here will pick them up.
+
+## Deprecated: `traverse`
+
+`traverse(dataset, start, direction="outgoing", predicates=None, max_depth=3, max_nodes=100)` — a
+breadth-first walk from a node along chosen predicates, returned as a per-level DAG — is
+deprecated. Its code (and tests) stay in `server.py`, but no toolset registers it, so no MCP
+client sees it.
+
+It was pulled after reviewing how an agent (Gemma 4, via the `kgqa-agent` BuildingQA benchmark,
+two runs × zero/one-shot, 744 questions over four building graphs) actually used it — 257 calls:
+
+- **Mostly a taxonomy lookup that usually had no taxonomy to walk.** 75% of calls followed
+  `rdfs:subClassOf` ("is VAV a Terminal_Unit?", "which Temperature_Setpoint subclasses exist?").
+  Only one of the four building graphs bundled the Brick class hierarchy; the others had none (or
+  42 stray triples), so those walks could only come back empty.
+- **Silent empty results that caused loops.** 25% of calls returned nothing, and the message
+  ("check the start term (search can find it)") couldn't tell "no such node" from "node exists
+  but has no such edges". For a class used in the data but not defined in the loaded ontology
+  (`brick:Electric_Meter`), `search` found the term, so the agent re-ran the same failing
+  `traverse` — 26 calls were exact repeats within a question.
+- **Noisy instance walks.** Every truncated result (24) was an unrestricted walk from an
+  instance, filled to the node cap by redundant 223P inverse edges (`cnx`, `connected`,
+  `connectedTo`/`From`, ...) and `rdf:type` hops into ontology clutter (`sh:NodeShape`, class
+  comments).
+- **Nothing it answered that `search` + one query couldn't.** Questions where the agent used it
+  scored lower and cost ~50% more tokens (confounded — it was reached for when already stuck —
+  but no case showed it answering something the other tools couldn't). A class's ancestors *with*
+  their shape are one query (`X rdfs:subClassOf* ?c . ?c rdfs:subClassOf ?p`), and it skipped
+  blank nodes, so it couldn't show Brick tags (`sh:rule`) or 223P constraints (`sh:property`) —
+  the parts that matter most when picking a class or an `EnumerationKind`.
+
+What replaces it: `search`'s `include_predicates`/`include_cbd` options return a hit's
+definition, parents, tags and constraints in the same call, and `run_query` no longer treats a
+property-path-only query (which it can't diagnose) as an error. A future ontology tool is more
+likely to describe one class fully (definition, parents/children, deprecation and replacement,
+tags, SHACL constraints) than to walk the graph.
