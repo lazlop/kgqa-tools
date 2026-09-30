@@ -9,8 +9,20 @@ import re
 
 import pytest
 from mcp.shared.memory import create_connected_server_and_client_session
+from rdflib import RDF, Graph, URIRef
+from rdflib.compare import isomorphic
 
-from sparql_relax_mcp.server import TOOLSET_ENV_VAR, _datasets, _parse_toolset, _schema_summaries, build_server, mcp
+from sparql_relax_mcp.server import (
+    TOOLSET_ENV_VAR,
+    _datasets,
+    _parse_toolset,
+    _schema_summaries,
+    _remove_inferred_superclass_types,
+    _strip_ontology,
+    _subclass_hierarchy,
+    build_server,
+    mcp,
+)
 
 # Uses the Brick namespace (rather than an arbitrary made-up one) because diagnose's
 # connection path search defaults to Brick/223P/RDFS/QUDT predicates only (see
@@ -158,6 +170,124 @@ async def test_summarize_schema_member_counts_is_opt_in():
         # The flag only adds a field -- it doesn't change anything else about the summary.
         assert with_counts["class_graph"] == without["class_graph"]
         assert with_counts["compression_pct"] == without["compression_pct"]
+
+
+ONTOLOGY_DATA_TTL = """
+@prefix brick: <https://brickschema.org/schema/Brick#> .
+@prefix ex: <http://example.org/bldg#> .
+ex:vav1 a brick:VAV ; brick:feeds ex:zone1 ; brick:hasExternalReference [ brick:id "vav-1" ] .
+ex:vav2 a brick:VAV ; brick:feeds ex:zone2 ; brick:hasExternalReference [ brick:id "vav-2" ] .
+ex:zone1 a brick:Zone .
+ex:zone2 a brick:Zone .
+ex:pump1 a brick:Pump .
+ex:temp1 a brick:Temperature_Sensor ; brick:measures brick:Temperature .
+ex:site1 a brick:Site .
+"""
+
+# Data (`ex:`) lives in its own namespace, as it does in real building graphs; the ontology
+# (`brick:`, `tag:`) is what gets stripped. `ex:site1` is named by a shape's sh:targetNode and
+# nothing else in the data, and `ex:`'s own owl:Ontology header is removed -- yet `ex:` stays,
+# since its real data outnumbers both.
+ONTOLOGY_TTL = """
+@prefix brick: <https://brickschema.org/schema/Brick#> .
+@prefix ex: <http://example.org/bldg#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix tag: <https://brickschema.org/schema/BrickTag#> .
+ex: a owl:Ontology ; owl:imports <https://brickschema.org/schema/Brick> .
+<https://brickschema.org/schema/Brick> a owl:Ontology ; owl:imports <http://qudt.org/schema/qudt> .
+brick:VAV a owl:Class, sh:NodeShape ;
+    rdfs:subClassOf [ a owl:Restriction ; owl:onProperty brick:feeds ; owl:someValuesFrom brick:Zone ] ;
+    sh:property [ sh:path brick:feeds ; sh:in ( ex:zone1 ex:zone2 ) ] ;
+    brick:hasAssociatedTag tag:VAV .
+tag:VAV a brick:Tag ; rdfs:label "VAV" .
+brick:Zone a owl:Class .
+brick:Terminal_Unit a owl:Class .
+brick:VAV rdfs:subClassOf brick:Terminal_Unit .
+brick:feeds a owl:ObjectProperty ; rdfs:domain brick:VAV .
+brick:Metaclass rdfs:subClassOf rdfs:Class .
+brick:Pump a brick:Metaclass .
+brick:Temperature a brick:Quantity ; rdfs:label "Temperature" .
+brick:NumericValue sh:or ( [ sh:datatype brick:float ] [ sh:datatype brick:int ] ) .
+brick:SiteShape a sh:NodeShape ; sh:targetNode ex:site1 .
+"""
+
+
+# What a reasoner adds on top of ONTOLOGY_DATA_TTL, given ONTOLOGY_TTL's brick:VAV rdfs:subClassOf
+# brick:Terminal_Unit.
+INFERRED_TYPES_TTL = """
+@prefix brick: <https://brickschema.org/schema/Brick#> .
+@prefix ex: <http://example.org/bldg#> .
+ex:vav1 a brick:Terminal_Unit .
+ex:vav2 a brick:Terminal_Unit .
+"""
+
+
+def test_remove_inferred_superclass_types_keeps_only_the_most_specific_type():
+    graph = Graph().parse(
+        data="""
+        @prefix ex: <http://example.org/bldg#> .
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+        ex:VAV rdfs:subClassOf ex:Terminal_Unit . ex:Terminal_Unit rdfs:subClassOf ex:Equipment .
+        ex:Pump rdfs:subClassOf ex:Pumpe . ex:Pumpe rdfs:subClassOf ex:Pump .
+        ex:vav1 a ex:VAV, ex:Terminal_Unit, ex:Equipment, ex:Tagged .
+        ex:pump1 a ex:Pump, ex:Pumpe .
+        """,
+        format="turtle",
+    )
+    removed = _remove_inferred_superclass_types(graph, _subclass_hierarchy(graph))
+
+    # Both ancestors go (even the one two levels up); an unrelated type stays; and classes that
+    # are each other's subclass (a cycle -- effectively equivalent) don't remove each other.
+    assert removed == 2
+    ex = "http://example.org/bldg#"
+    assert {str(o) for o in graph.objects(URIRef(ex + "vav1"), RDF.type)} == {ex + "VAV", ex + "Tagged"}
+    assert {str(o) for o in graph.objects(URIRef(ex + "pump1"), RDF.type)} == {ex + "Pump", ex + "Pumpe"}
+
+
+def test_strip_ontology_leaves_exactly_the_instance_data():
+    graph = Graph()
+    graph.parse(data=ONTOLOGY_DATA_TTL + ONTOLOGY_TTL, format="turtle")
+    expected = Graph()
+    expected.parse(data=ONTOLOGY_DATA_TTL, format="turtle")
+
+    original_size = len(graph)
+    removed = _strip_ontology(graph)
+
+    # Restriction/property-shape/list blank nodes go with their class, and the ontology's
+    # individuals (tag:VAV, brick:Temperature) with its namespaces; the data's own
+    # hasExternalReference blank nodes, and data that uses ontology terms, stay.
+    assert removed == original_size - len(expected)
+    assert isomorphic(graph, expected)
+
+
+@pytest.mark.asyncio
+async def test_summarize_schema_exclude_ontology_is_opt_in_and_cached_separately():
+    async with create_connected_server_and_client_session(mcp) as client:
+        bundled = ONTOLOGY_DATA_TTL + INFERRED_TYPES_TTL + ONTOLOGY_TTL
+        await client.call_tool("load_dataset", {"name": "bundled", "data": bundled})
+        await client.call_tool("load_dataset", {"name": "data_only", "data": ONTOLOGY_DATA_TTL})
+
+        full = _result_json(await client.call_tool("summarize_schema", {"dataset": "bundled"}))
+        assert "ontology_triples_removed" not in full
+        assert "sh:NodeShape" in full["class_graph"]
+
+        stripped = _result_json(
+            await client.call_tool("summarize_schema", {"dataset": "bundled", "exclude_ontology": True})
+        )
+        assert stripped["ontology_triples_removed"] > 0
+        assert "owl:" not in stripped["class_graph"] and "sh:" not in stripped["class_graph"]
+        assert "Removed" in stripped["message"]
+        data_only = _result_json(await client.call_tool("summarize_schema", {"dataset": "data_only"}))
+        assert "inferred" not in stripped["message"] and "inferred_types_removed" not in stripped
+        assert "brick:Terminal_Unit" not in stripped["class_graph"]
+        assert stripped["compression_pct"] == data_only["compression_pct"]
+
+        # Each flag value is cached on its own; the default call still returns the unstripped summary.
+        assert set(_schema_summaries["bundled"]) == {False, True}
+        again = _result_json(await client.call_tool("summarize_schema", {"dataset": "bundled"}))
+        assert again == full
 
 
 INSTANCE_NAME_TTL = """

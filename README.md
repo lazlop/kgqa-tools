@@ -12,7 +12,7 @@ that need to understand and query a knowledge graph.
   file) into memory under `name`. Replaces any dataset already loaded under that name.
 - **`list_datasets()`** — list loaded datasets with their format and triple count.
 - **`summarize_schema(dataset, iterations=10, similarity_threshold=0.3,
-  include_member_counts=False)`** — summarize the dataset's structure into a compact
+  include_member_counts=False, exclude_ontology=False)`** — summarize the dataset's structure into a compact
   `bs:`-namespaced class graph (via bschema), so an agent can see the graph's repeated patterns
   before writing any SPARQL against it. Call this **once** per dataset, right after
   `load_dataset`; the result is cached, so a repeat call is free but won't reflect changes until
@@ -21,7 +21,32 @@ that need to understand and query a knowledge graph.
   match, since real graphs rarely have perfectly identical instance patterns. Pass
   `include_member_counts=True` to also get `member_counts`, a mapping from each derived class's
   CURIE to how many real instances it collapsed (e.g. `{"bs:VAV_version_1": 50}`) — off by default to keep
-  the common-case response small.
+  the common-case response small. Pass `exclude_ontology=True` when the dataset bundles its
+  ontology (Brick, 223P, ...) alongside the instance data: classes (`owl:Class`/`rdfs:Class`, or
+  a metaclass subclassing one, like `s223:Class`), properties, SHACL shapes and ontology headers
+  are dropped before summarizing, along with the blank nodes hanging off them (restrictions,
+  property shapes, rules, lists), and then every other subject in the ontology's namespaces
+  (e.g. Brick's tags, quantities and substances), so the summary shows the data's patterns rather
+  than the ontology's. A namespace counts as the ontology's when most of its subjects are
+  ontology terms (or referenced only by them), so the data's own namespace stays even if it holds
+  an `owl:Ontology` header, as long as the data doesn't share a namespace with the ontology.
+  Instance data typed with those classes is kept, and only the summary is affected (`run_query`
+  still sees everything). **This goes beyond strictly removing the ontology:** it also drops
+  inferred superclass types from the instance data (`ex:vav1 a brick:Terminal_Unit` when
+  `ex:vav1 a brick:VAV` is there too), since a reasoner adds those unevenly and they only add
+  noise to a summary. Only the `rdfs:subClassOf` hierarchy bundled in the dataset is used, so a
+  type whose subclass link lives in an ontology that wasn't loaded stays. This part is left out of
+  the tool's own description and response, so it doesn't distract the agent. The response adds
+  `ontology_triples_removed`.
+
+  What counts as "ontology" here rests on assumptions drawn from how Brick and 223P are defined:
+  terms are typed as OWL/RDFS classes and properties or SHACL shapes (or with a metaclass, like
+  `s223:Class`, declared a subclass of `rdfs:Class`), their supporting structure hangs off them
+  as blank nodes, and the ontology lives in its own namespaces, separate from the instance data.
+  It was checked against Brick- and 223P-based building graphs (see
+  `tests/test_strip_ontology_real.py`). Other ontologies that are defined differently, or data
+  that shares a namespace with its ontology, may not be handled correctly, and these rules may be
+  updated in the future.
 - **`run_query(dataset, query, row_limit=3, connect=False, suggest_fixes=True)`** — the one tool
   for running queries, of any form (`SELECT`, `ASK`, `CONSTRUCT`, `DESCRIBE`). Returns the
   query's results (`variables`/`rows`, `result`, or `triples`, by `form`) *and* diagnoses it in
