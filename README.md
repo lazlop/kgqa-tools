@@ -142,6 +142,83 @@ ontology into the same dataset (`load_dataset` with `path` after downloading, or
 - **ASHRAE 223P** (`s223:`): <https://open223.info/223p.ttl>
 - **Brick** (`brick:`): <https://brickschema.org/schema/1.4.4/Brick.ttl>
 
+## Skill: mapping points to 223P and Brick
+
+`skills/building-point-classes/` is a Claude Code skill for a common job these tools support:
+turning a point list (BACnet objects, a BMS export, Haystack tags) into 223P or Brick classes.
+It contains:
+- the workflow: find the standard term, check extension shapes, extend minimally, keep
+  provenance, validate against a baseline;
+- 223P and Brick reference notes, including a table mapping common BACnet state texts to 223P
+  enumeration kinds;
+- tested SPARQL templates for browsing the taxonomies;
+- a SHACL validation script that diffs results against a baseline model.
+
+### Install
+
+Link the skill into your personal skills folder so it's available in every project:
+
+```bash
+ln -s "$PWD/skills/building-point-classes" ~/.claude/skills/building-point-classes
+```
+
+To share it with everyone working in one project instead, link or copy it into that project's
+`.claude/skills/` folder. Claude Code picks up new skills when a session starts, so start a new
+session after installing.
+
+The skill works best with:
+- **This MCP server registered** (see [Register with Claude Code](#register-with-claude-code)).
+  The skill uses `search` with `include_cbd_symmetric` to inspect candidate terms, and
+  `run_query` for its SPARQL templates. Without the server it falls back to rdflib.
+- **The ontologies on disk**: 223P and Brick (see [Ontologies](#ontologies)), plus any
+  extension whose shapes your model must satisfy, such as ASHRAE's G36 extension for 223P.
+- **For validation, a Python environment with
+  [BuildingMOTIF](https://github.com/NatLabRockies/BuildingMOTIF/tree/gtf-buildingmotif)
+  (`gtf-buildingmotif` branch) installed.** The validation script then uses the pyshifty
+  engine, which took about 20 seconds on a 4,300-triple 223P model. Otherwise it falls back to
+  TopQuadrant (`brick-tq-shacl`, needs Java; about 50 seconds) and then pyshacl (too slow for
+  223P).
+
+### Use
+
+You don't need to call the skill by name. Claude loads it when you ask for something it covers,
+for example:
+
+- "Here's the BACnet export from our VAV controller, with state texts in `states.csv`. Make a
+  223P model of the points, using standard enumeration kinds wherever they fit."
+- "What Brick classes should these AHU points get? SA-T, CHW-ST, SF-S, SF-C, ZN-T-SP"
+- "Our controller has a multistate 'Economizer State' with five states. Model it in 223P with
+  whatever extension it needs."
+
+You can also invoke it directly with `/building-point-classes`.
+
+Include the state texts of binary and multi-state objects when you have them (the
+inactive/active text, or the `state-text` array). They decide the enumeration kind, and the
+skill will ask for them rather than guess. Expect back:
+- the model or class choices;
+- any extension terms, as Turtle;
+- a mapping table with one row per point;
+- a report listing what was reused, what was extended, the judgement calls and what wasn't
+  modelled.
+
+The validation script can also be run on its own:
+
+```bash
+python skills/building-point-classes/scripts/validate.py model.ttl extension.ttl \
+    --ontology 223p.ttl --ontology g36.ttl \
+    --ontology VOCAB_QUDT-UNITS-ALL.ttl --ontology VOCAB_QUDT-QUANTITY-KINDS-ALL.ttl \
+    --baseline previous_model.ttl --focus
+```
+
+With `--baseline`, it prints only the results that appeared or disappeared since the previous
+model. That's what matters after a change, since 223P reports many advisory warnings on any
+partial model. `--engine` forces `pyshifty`, `topquadrant` or `pyshacl`.
+
+If you build models with BuildingMOTIF, use this skill alongside BuildingMOTIF's own agent
+skill. That skill runs the build, validate and repair loop. This one decides which class,
+enumeration kind and extension terms each point gets, which repair proposals can't do: they
+check type, not meaning.
+
 ## What the output looks like
 
 Every URI a tool returns is abbreviated to `prefix:local` (e.g. `s223:Zone`) instead of a full

@@ -1,0 +1,23 @@
+{
+  "skill_name": "building-point-classes",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I exported the binary and multistate objects from our VAV controller with their state texts (bacnet_states_192.168.0.133.csv). Pick a 223P enumeration kind for each one. Use what's already in 223P where you can and only extend where you have to. Give me the extension as turtle and a table of which point gets which kind.",
+      "expected_output": "Reuses Binary-Position for Opened/Closed, Occupancy-Motion for No Motion/Motion, Binary-OnOff for Off/On and Stopped/Running, and Binary-Logical for False/True, Disabled/Enabled and No/Yes. Extends only Auto/Manual, Warm/Cool Air and the multi-state kinds, with complete member lists. Notes the G36 window-switch conflict and the Standby Mode (Vacant/Occupied) ambiguity.",
+      "files": ["/home/lazlo/Desktop/semantics/copper/bacnet_states_192.168.0.133.csv"]
+    },
+    {
+      "id": 2,
+      "prompt": "can you give me brick classes for these AHU points? SA-T, RA-T, MA-T, CHW-ST (chilled water supply temp from the plant), CHW-RT, SF-S (supply fan status, on/off), SF-C (supply fan start/stop), ZN-T-SP (zone temp setpoint, not sure if heating or cooling), OA-DMPR-CMD (0-100%), ECON-ENA",
+      "expected_output": "Uses current classes: Leaving_/Entering_Chilled_Water_Temperature_Sensor rather than the deprecated Chilled_Water_Supply/Return names. Fan_On_Off_Status for SF-S and a start/stop command class for SF-C. For the ambiguous zone setpoint, a non-deprecated common parent (not Zone_Air_Temperature_Setpoint), with the ambiguity flagged. A damper position command, and an enable command for the economizer.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Our AHU controller has a multistate value 'Economizer State' with states 1=Disabled, 2=Minimum OA, 3=Modulating, 4=Full Economizer, 5=Lockout (High OAT), and a BV 'Economizer Enable' with Off/On. Model both as 223P properties of the AHU, with any extension needed, and the BACnet references (device 2001, MV12 and BV30).",
+      "expected_output": "An EnumeratedObservableProperty with a new extension kind, following 223P's naming and encoding (self-typed s223:Class and sh:NodeShape, subClassOf s223:EnumerationKind, five members with labels). The enable is an EnumeratedActuatableProperty on Binary-OnOff with no extension. BACnet external references for both, and a state mapping for each state value. The report lists the extension and any judgement calls.",
+      "files": []
+    }
+  ]
+}
