@@ -854,6 +854,37 @@ def _subclass_hierarchy(graph: Graph) -> dict[Any, set[Any]]:
     return parents_of
 
 
+_BUNDLED_ONTOLOGIES_DIR = Path(__file__).parent / "ontologies"
+"""Ontologies shipped with the package (every `*.ttl` here) whose `rdfs:subClassOf` hierarchy is
+used even when a dataset doesn't bundle it -- see `_known_hierarchy`."""
+
+_known_hierarchy_cache: Optional[dict[Any, set[Any]]] = None
+
+
+def _known_hierarchy() -> dict[Any, set[Any]]:
+    """The `_subclass_hierarchy` of every ontology in `_BUNDLED_ONTOLOGIES_DIR`, parsed once.
+
+    Merged into a dataset's own hierarchy before `_remove_inferred_superclass_types`: a graph can
+    carry a reasoner's supertypes on every instance (`ex:fan1 a s223:Fan, s223:Equipment,
+    s223:Connectable`) without the class hierarchy itself, and those supertypes are what make
+    unrelated entities look alike to bschema's similarity grouping."""
+    global _known_hierarchy_cache
+    if _known_hierarchy_cache is None:
+        ontologies = Graph()
+        for path in sorted(_BUNDLED_ONTOLOGIES_DIR.glob("*.ttl")):
+            ontologies.parse(path, format="turtle")
+        _known_hierarchy_cache = _subclass_hierarchy(ontologies)
+    return _known_hierarchy_cache
+
+
+def _with_known_hierarchy(parents_of: dict[Any, set[Any]]) -> dict[Any, set[Any]]:
+    """`parents_of` (a dataset's own hierarchy) plus `_known_hierarchy()`, as a new dict."""
+    merged = {cls: set(parents) for cls, parents in _known_hierarchy().items()}
+    for cls, parents in parents_of.items():
+        merged.setdefault(cls, set()).update(parents)
+    return merged
+
+
 def _remove_inferred_superclass_types(graph: Graph, parents_of: dict[Any, set[Any]]) -> int:
     """Remove `?s a ?parent` wherever `?s` is also typed with a strict subclass of `?parent`
     (per `parents_of`, from `_subclass_hierarchy`), returning how many triples were removed.
@@ -862,8 +893,8 @@ def _remove_inferred_superclass_types(graph: Graph, parents_of: dict[Any, set[An
     (`ex:vav1 a brick:VAV, brick:Terminal_Unit, brick:HVAC_Equipment, brick:Equipment`). For a
     schema summary they only add noise -- the most specific type already implies the rest -- and
     they split otherwise-identical subjects into different patterns whenever inference was applied
-    unevenly. Only the hierarchy the graph itself bundles is known, so a type whose subclass link
-    lives in an ontology that wasn't loaded stays. "Strict" means a type is only dropped for a
+    unevenly. Only the hierarchy in `parents_of` is known, so a type whose subclass link lives in
+    neither the graph nor `_known_hierarchy()` stays. "Strict" means a type is only dropped for a
     subclass it isn't also a subclass of, so classes declared equivalent via a subclass cycle
     never knock each other out.
     """
@@ -1054,7 +1085,7 @@ def summarize_schema(
             # types from the instance data (see _remove_inferred_superclass_types and the
             # README). Deliberately left out of this tool's docstring and response: it's a
             # summary-quality detail that would only distract an agent reading them.
-            hierarchy = _subclass_hierarchy(data_graph)
+            hierarchy = _with_known_hierarchy(_subclass_hierarchy(data_graph))
             ontology_triples_removed = _strip_ontology(data_graph)
             _remove_inferred_superclass_types(data_graph, hierarchy)
 

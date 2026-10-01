@@ -11,12 +11,12 @@ Graphs are compared after RDFC-1.0 canonicalization (via pyoxigraph -- rdflib's 
 with the explicit datatype on every string.
 
 The graphs go through what `summarize_schema(exclude_ontology=True)` does: strip the ontology,
-then drop inferred superclass types using the bundled hierarchy. Caveats on "identical":
+then drop inferred superclass types using the bundled hierarchy plus the shipped ontologies' (223P, Brick).
+Caveats on "identical":
 - remove_ontology.py dropped inferred superclass types against the *full* ontology files. b59
   bundles only a slice of 223P, which misses the links above ~950 of them (s223:Equipment,
-  s223:Connectable, ...), so for b59 the full 223P pass (`_remove_less_specific_classes`) is
-  still applied on top, along with its node renaming (`_rename_b59_nodes`) -- both copied from
-  that script.
+  s223:Connectable, ...); the shipped 223P has to cover those. That script also renamed
+  b59's nodes, so that (`_rename_b59_nodes`, copied from it) is applied before comparing.
 - The other way round, bldg11's bundled Brick does link the 10 `brick:Command`s the reference
   kept to a more specific type of theirs (`brick:Heating_Command`), so the same cleanup is
   applied to the reference too, and exactly those 10 are asserted to be the difference.
@@ -30,11 +30,15 @@ import pyoxigraph
 import pytest
 from rdflib import RDF, RDFS, Graph, Namespace
 
-from sparql_relax_mcp.server import _remove_inferred_superclass_types, _strip_ontology, _subclass_hierarchy
+from sparql_relax_mcp.server import (
+    _remove_inferred_superclass_types,
+    _strip_ontology,
+    _subclass_hierarchy,
+    _with_known_hierarchy,
+)
 
 KGQA_AGENT_DATA = Path(__file__).resolve().parents[2] / "kgqa-agent" / "data"
 EVAL_BUILDINGS_DIR = KGQA_AGENT_DATA / "eval_buildings"
-S223_ONTOLOGY = KGQA_AGENT_DATA / "ontologies" / "223p.ttl"
 
 pytestmark = pytest.mark.skipif(
     not (EVAL_BUILDINGS_DIR / "without-ontology").exists(),
@@ -49,15 +53,6 @@ def _canonical(graph: Graph) -> pyoxigraph.Dataset:
     dataset = pyoxigraph.Dataset(pyoxigraph.parse(triples, format=pyoxigraph.RdfFormat.N_TRIPLES))
     dataset.canonicalize(pyoxigraph.CanonicalizationAlgorithm.RDFC_1_0)
     return dataset
-
-
-def _remove_less_specific_classes(graph: Graph, ontology: Graph) -> Graph:
-    query = """
-        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-        CONSTRUCT { ?s a ?parent . }
-        WHERE { ?s a ?child . ?child rdfs:subClassOf+ ?parent . ?s a ?parent . }
-    """
-    return graph - (graph + ontology).query(query).graph
 
 
 def _rename_b59_nodes(graph: Graph) -> None:
@@ -81,11 +76,10 @@ def _rename_b59_nodes(graph: Graph) -> None:
 @pytest.mark.parametrize("building", ["bldg11.ttl", "b59.ttl", "TUC_building.ttl", "dflexlibs_multizone.ttl"])
 def test_strip_ontology_matches_hand_cleaned_graph(building):
     graph = Graph().parse(EVAL_BUILDINGS_DIR / building)
-    hierarchy = _subclass_hierarchy(graph)
+    hierarchy = _with_known_hierarchy(_subclass_hierarchy(graph))
     removed = _strip_ontology(graph)
     _remove_inferred_superclass_types(graph, hierarchy)
     if building == "b59.ttl":
-        graph = _remove_less_specific_classes(graph, Graph().parse(S223_ONTOLOGY))
         _rename_b59_nodes(graph)
     expected = Graph().parse(EVAL_BUILDINGS_DIR / "without-ontology" / building)
     missed_by_reference = _remove_inferred_superclass_types(expected, hierarchy)

@@ -18,6 +18,7 @@ from sparql_relax_mcp.server import (
     _parse_toolset,
     _schema_summaries,
     _remove_inferred_superclass_types,
+    _with_known_hierarchy,
     _strip_ontology,
     _subclass_hierarchy,
     TOOLSETS,
@@ -253,6 +254,25 @@ def test_remove_inferred_superclass_types_keeps_only_the_most_specific_type():
     ex = "http://example.org/bldg#"
     assert {str(o) for o in graph.objects(URIRef(ex + "vav1"), RDF.type)} == {ex + "VAV", ex + "Tagged"}
     assert {str(o) for o in graph.objects(URIRef(ex + "pump1"), RDF.type)} == {ex + "Pump", ex + "Pumpe"}
+
+
+def test_remove_inferred_superclass_types_uses_the_shipped_ontologies_hierarchies():
+    # No 223P or Brick hierarchy in the graph, just a reasoner's supertypes on the instances.
+    graph = Graph().parse(
+        data="""
+        @prefix s223: <http://data.ashrae.org/standard223#> .
+        @prefix brick: <https://brickschema.org/schema/Brick#> .
+        @prefix ex: <http://example.org/bldg#> .
+        ex:fan1 a s223:Fan, s223:Equipment, s223:Connectable .
+        ex:vav1 a brick:VAV, brick:Terminal_Unit, brick:HVAC_Equipment, brick:Equipment .
+        """,
+        format="turtle",
+    )
+    assert _remove_inferred_superclass_types(graph, _subclass_hierarchy(graph)) == 0
+    assert _remove_inferred_superclass_types(graph, _with_known_hierarchy(_subclass_hierarchy(graph))) == 5
+    ex = "http://example.org/bldg#"
+    assert {str(o) for o in graph.objects(URIRef(ex + "fan1"), RDF.type)} == {"http://data.ashrae.org/standard223#Fan"}
+    assert {str(o) for o in graph.objects(URIRef(ex + "vav1"), RDF.type)} == {"https://brickschema.org/schema/Brick#VAV"}
 
 
 def test_strip_ontology_leaves_exactly_the_instance_data():
