@@ -841,7 +841,7 @@ dev = [
 [[package]]
 name = "sparql-relax-rs"
 version = "0.1.0"
-source = { git = "https://github.com/lazlop/sparql-relax?subdirectory=sparql-relax-py#2775fd0191e2e4bde821bd446313fa382d25a7a4" }
+source = { git = "https://github.com/lazlop/sparql-relax?subdirectory=sparql-relax-py#f7a47053bf0750f6f7b6c0be491b9945703f5509" }
 
 [[package]]
 name = "sse-starlette"
