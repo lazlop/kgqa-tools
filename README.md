@@ -368,6 +368,9 @@ server exposes one of two toolsets:
 - **`extended`** (default): all five tools — the core four plus `search`.
 - **`core`**: just `load_dataset`, `list_datasets`, `summarize_schema` and `run_query`.
 
+See [Why there's a `core` and an `extended` toolset](docs/toolsets.md) for what each is for and
+how they compare on a KGQA benchmark.
+
 Pick one with `--toolset` after the command, or with the `SPARQL_RELAX_TOOLSET` environment
 variable (the flag wins if both are set). The server's instructions to the agent change to match,
 so a `core` agent is never told about tools it doesn't have.
